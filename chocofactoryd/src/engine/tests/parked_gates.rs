@@ -640,13 +640,14 @@ async fn a_note_at_a_parked_gate_without_a_pr_still_goes_to_revising() {
             "{}: the merge watcher is stopped",
             rig.label
         );
-        // The coder's prompt shows the full note.
+        // The coder's prompt doesn't carry the note: it reads it with `get_context`.
         let prompt = fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/prompts/coder-revise.md"),
         )
         .unwrap();
         let (rendered, _) = crate::template::render(&prompt, &state.payload).unwrap();
-        assert!(rendered.contains(note), "{}: {rendered}", rig.label);
+        assert!(!rendered.contains(note), "{}: {rendered}", rig.label);
+        assert!(rendered.contains("Get your context first"), "{}", rig.label);
         assert_eq!(stub.all_calls(), "");
         rig.engine.cancel_task(&rig.task_id, false).await.unwrap();
     }

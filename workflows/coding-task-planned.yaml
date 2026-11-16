@@ -34,7 +34,9 @@ roles:
 stages:
   # Checks the task's spec against the code the coder will start from, and
   # writes the hardened version that every later stage reads in place of
-  # the task text (`{{ stages.spec_check.summary }}`). It reports `ready`
+  # the task text. The coder and the reviewer fetch it with `get_context`
+  # (`{"source":"stage","stage":"spec_check","outcome":"ready"}`) and read the
+  # whole planner report; it isn't templated into their prompts. It reports `ready`
   # when nothing is left to decide. It reports `needs_input` to park the
   # task for a human's answers, which it does only when it would otherwise
   # have to guess what the user wants. Because of `report_sections:`, the

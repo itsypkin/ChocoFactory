@@ -34,13 +34,12 @@ impl Drop for TempDir {
     }
 }
 
-const COPIES: [&str; 12] = [
+const COPIES: [&str; 11] = [
     "prompts/planner-system.md",
     "prompts/planner-turn.md",
     "prompts/coder-system.md",
     "prompts/coder-turn-planned.md",
     "prompts/reviewer-system.md",
-    "prompts/reviewer-turn-planned.md",
     "prompts/writer-system.md",
     "prompts/writer-turn-planned.md",
     "scripts/open-pr.sh",
@@ -200,7 +199,10 @@ fn review_panel_has_the_decided_shape() {
     let (_, pf, sections) = agent_turn_parts(&branches["internal_review"].def.kind);
     let pf = pf.expect("internal_review prompt_file");
     assert_eq!(pf.file_name().unwrap(), "reviewer-turn-planned.md");
-    assert_eq!(
+    // The panel's reviewer turn is a deliberate fork of the shipped one: its
+    // previous governing review is the lead's applied report, not the branch's.
+    assert_eq!(pf, &exp().join("prompts/reviewer-turn-planned.md"));
+    assert_ne!(
         fs::read(pf).unwrap(),
         fs::read(root().join("workflows/prompts/reviewer-turn-planned.md")).unwrap()
     );
@@ -357,6 +359,7 @@ fn no_unlisted_fork_of_a_shipped_file() {
     list(&exp().join("scripts"), "scripts/", &mut found);
     let mut expected: BTreeSet<String> = COPIES.iter().map(|s| s.to_string()).collect();
     expected.insert("prompts/coder-revise-planned.md".into());
+    expected.insert("prompts/reviewer-turn-planned.md".into());
     expected.extend(NEW_FILES.iter().map(|s| s.to_string()));
     assert_eq!(
         found, expected,
@@ -367,8 +370,9 @@ fn no_unlisted_fork_of_a_shipped_file() {
     let orig =
         fs::read_to_string(root().join("workflows/prompts/coder-revise-planned.md")).unwrap();
     assert_ne!(revise, orig);
-    assert!(revise.contains("{{ stages.lead_review.summary }}"));
-    assert!(!revise.contains("{{ stages.internal_review"));
+    assert!(revise.contains(r#"{"source":"stage","stage":"lead_review"}"#));
+    assert!(!revise.contains("internal_review"));
+    assert!(!revise.contains("{{ stages."));
 
     let mut shipped = Vec::new();
     for d in ["workflows/prompts", "workflows/scripts"] {
@@ -489,35 +493,125 @@ fn the_security_reader_has_a_blocking_bar_and_reads_material_as_material() {
     }
 }
 
-/// (#333) The lead decides, so it reads a human's answer to a blocker too.
+/// The lead retrieves what it needs and still reads this lap's three branch
+/// reports inline, because a parallel branch's capture isn't an applied stage
+/// result. It also carries the full-SHA instruction, which the stage's
+/// `report_sections` doesn't enforce.
 #[test]
-fn lead_review_shows_the_blockers_answer_between_markers() {
-    let answer = "ANSWER-LINE-ONE: use serde 1.x.\nANSWER-LINE-TWO: my decision.";
+fn lead_review_retrieves_its_context_and_reads_branch_reports_inline() {
     let prompt = fs::read_to_string(exp().join("prompts/lead-review.md")).unwrap();
     let payload = serde_json::json!({
-        "task": { "title": "T", "input": "THE TASK" },
-        "finished_stages": ["spec_check", "coding", "blocker", "revising", "review_panel"],
+        "task": { "title": "T", "input": "SENTINEL-TASK", "closes": "" },
         "stages": {
-            "spec_check": { "summary": "THE SPEC" },
-            "blocker": answer,
-            "security_review": { "outcome": "clean", "summary": "S" },
-            "architecture_review": { "outcome": "clean", "summary": "A" },
-            "internal_review": { "outcome": "approved", "summary": "I" },
+            "spec_check": { "summary": "SENTINEL-SPEC" },
+            "blocker": "SENTINEL-BLOCKER-ANSWER",
+            "lead_review": { "summary": "SENTINEL-OLD-LEAD-REPORT" },
+            "security_review": { "outcome": "clean", "summary": "SENTINEL-SEC" },
+            "architecture_review": { "outcome": "clean", "summary": "SENTINEL-ARCH" },
+            "internal_review": { "outcome": "approved", "summary": "SENTINEL-ALL-ROUND" },
         },
     });
     let (rendered, _) = render(&prompt, &payload).unwrap();
-    assert_eq!(rendered.matches("ANSWER-LINE-ONE").count(), 1);
-    let open = rendered.find("<blocker_answer>\n").unwrap() + "<blocker_answer>\n".len();
-    let close = rendered.find("</blocker_answer>").unwrap();
-    assert_eq!(rendered[open..close].trim_end(), answer);
+    for stale in [
+        "SENTINEL-TASK",
+        "SENTINEL-SPEC",
+        "SENTINEL-BLOCKER-ANSWER",
+        "SENTINEL-OLD-LEAD-REPORT",
+    ] {
+        assert!(!rendered.contains(stale), "{stale} is still templated in");
+    }
+    for inline in ["SENTINEL-SEC", "SENTINEL-ARCH", "SENTINEL-ALL-ROUND"] {
+        assert_eq!(rendered.matches(inline).count(), 1, "{inline}");
+    }
     let text = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        text.contains(
-            "where it conflicts with the agreed spec above, the answer wins, and work that \
-             follows it is not a defect. Check that the work does follow it."
-        ),
-        "{text}"
+    for clause in [
+        r#"`{"source":"stage","stage":"lead_review"}`"#,
+        r#"`{"source":"stage","stage":"spec_check","outcome":"ready"}`"#,
+        "They are not retrievable stage results, so they are given here",
+        "the group's earlier laps can't be looked up",
+        "Put `Reviewed: <full HEAD SHA>`, the complete 40-character SHA you reviewed, in your summary",
+        "A defect already present at your previous `Reviewed` commit is a prominent NONBLOCKING advisory",
+    ] {
+        assert!(text.contains(clause), "lead prompt lacks \"{clause}\"");
+    }
+    // `report_sections` doesn't enforce the SHA, and this change doesn't add it.
+    let def = load(&exp().join("review-panel.yaml"));
+    let StageKind::AgentTurn {
+        report_sections, ..
+    } = &def.stages["lead_review"].kind
+    else {
+        panic!("lead_review is not an agent turn");
+    };
+    assert_eq!(
+        report_sections,
+        &["Prior findings", "Reviewers", "Findings", "Dismissed"]
     );
+}
+
+/// The panel's all-round reviewer is a fork of the shipped planned reviewer
+/// turn. Its previous governing review is the lead's applied report, and it
+/// promises neither branch history nor an aggregate of captures.
+#[test]
+fn the_panels_reviewer_retrieves_the_applied_lead_review_not_branch_history() {
+    let panel = fs::read_to_string(exp().join("prompts/reviewer-turn-planned.md")).unwrap();
+    let shipped =
+        fs::read_to_string(root().join("workflows/prompts/reviewer-turn-planned.md")).unwrap();
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let panel_text = flat(&panel);
+    for clause in [
+        r#"Call `{"source":"stage","stage":"lead_review"}`."#,
+        "a branch's report isn't an applied stage result you can retrieve",
+        "Don't look for earlier branch reports or an aggregate of them; they aren't retrievable",
+        "Wherever your instructions say your previous report, they mean this lead report.",
+        "Then there is no earlier lead report and that is fine.",
+    ] {
+        assert!(
+            panel_text.contains(clause),
+            "panel reviewer lacks \"{clause}\""
+        );
+    }
+    assert!(
+        !panel_text.contains(r#""stage":"internal_review""#),
+        "the panel reviewer must not look for a branch's own history"
+    );
+    // The shipped twin keeps the built-in lookup, so the two really differ.
+    assert!(flat(&shipped).contains(r#"{"source":"stage","stage":"internal_review"}"#));
+    // The experimental YAML says so.
+    let yaml = fs::read_to_string(exp().join("review-panel.yaml")).unwrap();
+    for clause in [
+        "A branch's report is",
+        "not an applied stage result",
+        r#"(`{"source":"stage","stage":"lead_review"}`)"#,
+        "doesn't promise branch history or an aggregate of the",
+    ] {
+        let squashed = flat(&yaml.replace("\n  # ", " "));
+        assert!(
+            squashed.contains(clause),
+            "review-panel.yaml lacks \"{clause}\""
+        );
+    }
+    // The routing and the guard are those of the decided shape.
+    let def = load(&exp().join("review-panel.yaml"));
+    let lead_on: Vec<_> = def.stages["lead_review"].on.iter().collect();
+    assert_eq!(
+        lead_on,
+        [
+            (&"approved".to_string(), &"describe_pr".to_string()),
+            (&"changes_requested".to_string(), &"revising".to_string()),
+        ]
+    );
+    let guard = def.stages["lead_review"].loop_guard.as_ref().unwrap();
+    assert_eq!((guard.on.as_str(), guard.max), ("changes_requested", 3));
+    // And the fork loads from a copy that follows links, as a user's does.
+    let out = TempDir::new();
+    let copy = out.0.join("review-panel");
+    copy_dereferenced(&exp(), &copy);
+    let copied = load(&copy.join("review-panel.yaml"));
+    let StageKind::Parallel { branches } = &copied.stages["review_panel"].kind else {
+        panic!("review_panel is not a parallel stage");
+    };
+    let (_, pf, _) = agent_turn_parts(&branches["internal_review"].def.kind);
+    assert_eq!(fs::read_to_string(pf.unwrap()).unwrap(), panel);
 }
 
 /// (#333) The experimental revise prompt is not a symlink, so the blocker
@@ -532,15 +626,10 @@ fn the_blocker_text_of_the_experimental_revise_prompt_matches_the_shipped_one() 
         let rest = &t[start + 1..];
         t[start..start + 1 + rest.find("\n- **`").expect("next entry")].to_string()
     };
-    let sections = |t: &str| {
-        let start = t.find("## Your blocker report").expect("blocker section");
-        t[start..start + t[start..].find("## When you're done").expect("closing")].to_string()
-    };
     let sentence = "Then call `report_outcome` with the outcome `done`, or `blocked` only as \
                     \"When you can't go on\" in your instructions allows.";
     let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_eq!(entry(&revise), entry(&shipped));
-    assert_eq!(sections(&revise), sections(&shipped));
     for text in [&revise, &shipped] {
         assert!(flat(text).contains(&flat(sentence)));
     }
@@ -747,6 +836,7 @@ fn the_experimental_revise_prompt_is_the_shipped_one_with_the_lead_wording() {
             format!("{lead}{}reviewer", &caps[1])
         })
         .replace("`internal_review`", "`lead_review`")
+        .replace("\"internal_review\"", "\"lead_review\"")
         .replace(
             "stages.internal_review.summary",
             "stages.lead_review.summary",

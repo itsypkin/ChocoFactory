@@ -45,6 +45,16 @@ such as deployment settings, a proxy or an OS policy, name that fact
 and mark the finding unconfirmed. An unconfirmed finding does not block
 on its own; the lead decides.
 
+## Scope
+
+Mark a finding blocking only when the defect is in code this branch added or
+changed, or that the branch makes newly reachable. A defect that was already in
+the code the change merely calls or sits next to is a non-blocking finding,
+whatever its seriousness. The lead applies the round's own, narrower bound (a
+human's request, or the corrections since the last review) and may downgrade
+what you mark blocking, so say which of your findings are in code the change
+touched.
+
 ## Report
 
 List every finding with `file:line`, what is wrong and what would fix it, and

@@ -28,8 +28,9 @@ stages:
   # to stop in the situation it is in or every way forward breaks a rule the
   # task sets (`coder-system.md`, "When you can't go on"). That lands on
   # `blocker`. `capture: json` is what makes the exit routable, and it keeps
-  # the coder's report as `stages.coding.summary` so the next lap, which is a
-  # fresh session, can read it back.
+  # the coder's report with the stage's result so the next lap, which is a
+  # fresh session, can read it back with `get_context`. The task text is not
+  # in the prompt: the coder reads it with `{"source":"task"}`.
   coding:
     kind: agent_turn
     role: coder
@@ -39,19 +40,17 @@ stages:
 
   # The single landing spot for every way work comes back. The coder is an
   # agent with tool access, so it can look up *why* it's back itself (CI
-  # logs, PR comments); only what it genuinely can't look up — a reviewer's
-  # own summary, a human's redirect note, or a conflict note — gets templated in
-  # (`coder-revise.md`). The prompt branches on `{{ arrival.from }}`/
-  # `{{ arrival.outcome }}` (#112, the engine's own record of the transition
-  # that landed here), not on which capture happens to be populated: both
-  # `stages.internal_review.summary` and `stages.escalate_to_human` persist
-  # across laps once either stage has ever run, so the prompt labels each
-  # one with the arrival path it's current for and tells the coder to
-  # ignore it on every other path. The same goes for `stages.blocker` (a
-  # human's answer to a blocker) and for the coder's own reports,
-  # `stages.coding.summary` and `stages.revising.summary`: the prompt labels
-  # them as current only on the `blocker` path. `revising` can itself report
-  # `blocked`, which lands on `blocker` again.
+  # logs, PR comments). Nothing it can't look up is templated into the prompt
+  # any more: the reviewer's report, the human's hand-offs, a conflict note and
+  # its own earlier reports are read with `get_context` (`coder-revise.md`),
+  # by following the result links from the point where this turn started. The
+  # prompt still branches on `{{ arrival.from }}`/`{{ arrival.outcome }}`
+  # (#112, the engine's own record of the transition that landed here) to say
+  # why the coder is back, but the arrival alone never says which human
+  # instruction governs: the coder finds it in the linked history, and it stays
+  # in force through later internal review rounds until another human
+  # instruction replaces it. `revising` can itself report `blocked`, which
+  # lands on `blocker` again.
   revising:
     kind: agent_turn
     role: coder
@@ -78,14 +77,16 @@ stages:
   # recurring defects live. "Prior findings" is not among them because a
   # first lap has none, and the turn prompt asks for it when there are.
   #
-  # `reviewer-turn.md` templates this stage's *own* previous capture, which
-  # is how a re-review gets the earlier report without the engine carrying
-  # anything new. On a first review there is no capture yet, so the
-  # placeholder renders empty. That is normal, so the engine only logs it:
-  # a reference to a stage that hasn't finished a run yet records no
-  # `template_unresolved` note on the task's timeline (#60). The same holds
-  # for `coder-revise.md`, where an empty one of two alternatives is the
-  # normal case rather than a mistake.
+  # `reviewer-turn.md` no longer templates the task, the previous report or
+  # the human's hand-offs. The reviewer reads them with `get_context`, from the
+  # point where this review started: its own previous report (the latest result
+  # that left this stage), the coder's latest report and the human request that
+  # governs. It decides what may block from that (`reviewer-system.md`, "Review
+  # scope"): a first review is the whole branch, a reviewer-started round only
+  # unresolved blockers and what the corrections caused, a human's round only
+  # the human's request. A review is called "first" only on a chain that is
+  # positively the initial one; context it can't read is a refusal to approve,
+  # never a first review.
   internal_review:
     kind: agent_turn
     role: reviewer
@@ -161,12 +162,12 @@ stages:
 
   # Reached when the coder reports `blocked` from `coding` or `revising`: it
   # hit a rule the task sets that leaves no way forward, and stopped instead of
-  # breaking it. The coder's report (`stages.coding.summary` or
-  # `stages.revising.summary`) is the briefing; read it with
+  # breaking it. The coder's report (the result that left `coding` or
+  # `revising`) is the briefing; read it with
   # `choco --json task status <id>`. The human answers with
   # `choco task send <id> --text "..."`. The answer goes to `revising` and is
-  # also shown to the internal reviewer (`reviewer-turn.md`), where it wins over
-  # the task text. `capture: text` keeps it. There is no loop guard, because
+  # also read by the internal reviewer through `get_context` (`reviewer-turn.md`),
+  # where it wins over the task text. `capture: text` keeps it. There is no loop guard, because
   # every round here waits on a human, and arriving here resets no loop count.
   # A PR merged by hand in the meantime ends the task as `done`, as at
   # `escalate_to_human`.

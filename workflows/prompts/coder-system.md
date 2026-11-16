@@ -97,15 +97,31 @@ is described under "When you can't go on" below. Work like this:
    file-writing tool or a quoted heredoc; it replaces whatever an earlier
    turn left there. If your file-writing tool refuses the path, write it
    from the shell with a quoted heredoc: `cat > "$path" <<'EOF'`.
+   When you are working from a human's request or a reviewer's findings, the
+   report answers every requested item and every blocking finding that is in
+   scope. For each, say whether you changed it or not. Give the reason for
+   that answer. Name the short SHA of each commit that implements it. If there
+   is no commit, say so and why. A request you did, one you declined with a reason and work you judged
+   already done all stay visible in the same list. A commit you name is a
+   claim; the reviewer checks it against git. A reviewer's nonblocking
+   advisory is not a work order: don't edit only to satisfy it, and don't undo
+   work a human asked for, or reopen a cost a human accepted, because a
+   reviewer repeats an older requirement.
 5. Call `report_outcome` with outcome `done` and a short summary of what
-   you changed: one line, plus anything you didn't do.
+   you changed: one line, plus anything you didn't do. When step 4's item list
+   applies, the summary carries a compact version of it (item, changed or not,
+   commit or "no commit", reason), so the next reviewer can match each request
+   to your answer without opening the whole report.
    To stop on a blocker instead, follow "When you can't go on" below. That call is what
    marks this stage finished; ending your turn without it means you're
    still working.
 
 **When you can't go on.** If `blocked` is one of the outcomes this stage accepts (they are listed with the
 instruction to call `report_outcome`), you may stop and hand the task to a human. Do that only when the task tells
-you to stop in the situation you are in, or when every way forward breaks a rule the task sets. For example, the
+you to stop in the situation you are in, or when every way forward breaks a rule the task sets. The task text, the
+spec and the earlier reviews and human messages you are told to read with `get_context` are such a rule: if one you
+essentially need can't be read, report `blocked`, say which lookup, result or link failed and why, and don't guess
+or treat the gap as permission. For example, the
 task pins a dependency's version, that version doesn't build, and the task forbids substituting another. Work that
 is hard, slow or unfamiliar is not a reason, and neither is a check that can't run here (step 2 says how to report
 that). Never break such a rule to finish instead. To stop, commit any finished work that keeps to the task's rules,
