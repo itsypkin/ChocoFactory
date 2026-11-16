@@ -778,6 +778,78 @@ async fn the_probe_fixtures_are_served_by_the_real_lookup() {
     assert_eq!(got[1].json()["result"]["result_id"], json!(ids[3]));
 }
 
+/// The probes' report checkers on hand-written reports: a right one passes,
+/// and each wrong classification fails on its own point. Free: no model.
+#[test]
+fn the_probe_checkers_tell_right_from_wrong_reports() {
+    let head = "5afd54d320ac1858a1f01470362cb61eac63f7e3";
+    let right = format!(
+        "Reviewed\nReviewed: {head}\n\nFindings\nF1. BLOCKING, repeated. bin/sync.sh:13.\n- `mkdir -p` still runs in dry-run.\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.\nA2. SERIOUS nonblocking advisory, present at dfc7bde. lib/copy.sh:5: `find -name '*.bak' -delete`.\n- Breaks the never-delete promise. Serious, but it predates the correction.\n\nDismissed\n- none"
+    );
+    check_mixed_rereview("changes_requested", &right, head).unwrap();
+    for (why, wrong) in [
+        (
+            "old defect made blocking",
+            right.replace("SERIOUS nonblocking advisory", "SERIOUS BLOCKING"),
+        ),
+        (
+            "old defect missing",
+            right.replace("copy.sh:5", "util.sh:5"),
+        ),
+        (
+            "old defect not serious",
+            right
+                .replace("Serious, but", "Minor, and")
+                .replace("SERIOUS ", ""),
+        ),
+        (
+            "regression nonblocking",
+            right.replace(
+                "F3. BLOCKING, new code",
+                "F3. nonblocking advisory, new code",
+            ),
+        ),
+        (
+            "earlier blocker nonblocking",
+            right.replace(
+                "F1. BLOCKING, repeated",
+                "F1. nonblocking advisory, repeated",
+            ),
+        ),
+        ("HEAD not named", right.replace(head, "5afd54d")),
+    ] {
+        assert!(
+            check_mixed_rereview("changes_requested", &wrong, head).is_err(),
+            "{why}"
+        );
+    }
+    assert!(check_mixed_rereview("approved", &right, head).is_err());
+
+    let human = format!(
+        "Findings\n1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.\n3. nonblocking: the soak run was accepted by the human, not required.\n\nDismissed\n- jitter. Reviewed: {head}"
+    );
+    check_human_round("changes_requested", &human, head).unwrap();
+    for (why, wrong) in [
+        (
+            "item 3 nonblocking",
+            human.replace("1. BLOCKING README", "1. nonblocking README"),
+        ),
+        (
+            "script nonblocking",
+            human.replace("2. BLOCKING scripts", "2. nonblocking scripts"),
+        ),
+        (
+            "soak revived",
+            human.replace("3. nonblocking: the soak", "3. BLOCKING: the soak"),
+        ),
+    ] {
+        assert!(
+            check_human_round("changes_requested", &wrong, head).is_err(),
+            "{why}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The paid probes
 // ---------------------------------------------------------------------------
@@ -874,51 +946,124 @@ fn wanted(name: &str) -> bool {
     std::env::var("CHOCO_REAL_PROBE").as_deref() == Ok(name)
 }
 
-/// The report's blocks: a block runs from a list marker or heading line to
-/// the line before the next one.
-fn blocks(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let t = line.trim_start();
-        let starts = line == t
-            && (t.starts_with("- ")
-                || t.starts_with("* ")
-                || t.starts_with('#')
-                || t.starts_with("**")
-                || t.chars().next().is_some_and(|c| c.is_ascii_digit())
-                || t.starts_with('('));
-        if starts || out.is_empty() || line.trim().is_empty() {
-            out.push(String::new());
+/// One finding of a report: its headline line and its whole text. A finding
+/// starts at a line that begins with a label such as `F1.`, `A2.`, `(F1)` or
+/// `3.`; bullets under it belong to it.
+struct Finding {
+    headline: String,
+    body: String,
+}
+
+fn findings(summary: &str) -> Vec<Finding> {
+    let start = regex::Regex::new(r"(?mi)^[#*\s]*findings[*:\s]*$").unwrap();
+    let end = regex::Regex::new(r"(?mi)^[#*\s]*dismissed[*:\s]*$").unwrap();
+    let label = regex::Regex::new(r"^(\(?[A-Za-z]{1,3}\d{1,2}[.)]|\d{1,2}[.)])\s").unwrap();
+    let from = start.find(summary).map(|m| m.end()).unwrap_or(0);
+    let rest = &summary[from..];
+    let rest = end.find(rest).map(|m| &rest[..m.start()]).unwrap_or(rest);
+    let mut out: Vec<Finding> = Vec::new();
+    for line in rest.lines() {
+        if label.is_match(line) || out.is_empty() {
+            out.push(Finding {
+                headline: line.to_string(),
+                body: String::new(),
+            });
         }
         let last = out.last_mut().unwrap();
-        last.push_str(line);
-        last.push('\n');
+        last.body.push_str(line);
+        last.body.push('\n');
     }
     out
 }
 
-fn has_any(block: &str, words: &[&str]) -> bool {
-    let lower = block.to_lowercase();
+fn nonblocking(headline: &str) -> bool {
+    let h = headline.to_lowercase();
+    ["nonblocking", "non-blocking", "not blocking", "advisory"]
+        .iter()
+        .any(|w| h.contains(w))
+}
+
+fn blocking(headline: &str) -> bool {
+    headline.to_lowercase().contains("blocking") && !nonblocking(headline)
+}
+
+fn has_any(text: &str, words: &[&str]) -> bool {
+    let lower = text.to_lowercase();
     words.iter().any(|w| lower.contains(w))
 }
 
-fn nonblocking(block: &str) -> bool {
-    has_any(
-        block,
-        &[
-            "nonblocking",
-            "non-blocking",
-            "not blocking",
-            "does not block",
-            "doesn't block",
-            "advisory",
-        ],
-    )
+/// Probe 1's verdict on a report: the unresolved earlier blocker and the
+/// correction-introduced regression block; the old defect in the unchanged
+/// callee is prominent, serious and nonblocking.
+fn check_mixed_rereview(outcome: &str, summary: &str, head: &str) -> Result<(), String> {
+    if outcome != "changes_requested" {
+        return Err(format!("outcome {outcome}"));
+    }
+    if !summary.contains(head) {
+        return Err(format!("the summary doesn't name the full HEAD SHA {head}"));
+    }
+    let all = findings(summary);
+    let about = |token: &'static str| all.iter().filter(move |f| f.body.contains(token));
+    if !about("mkdir").any(|f| blocking(&f.headline)) {
+        return Err("the unresolved earlier blocker (DEST still created) does not block".into());
+    }
+    if let Some(f) = about("mkdir").find(|f| nonblocking(&f.headline)) {
+        return Err(format!(
+            "the earlier blocker was made nonblocking: {}",
+            f.headline
+        ));
+    }
+    if !about("break").any(|f| blocking(&f.headline)) {
+        return Err("the correction-introduced regression does not block".into());
+    }
+    let old: Vec<&Finding> = all
+        .iter()
+        .filter(|f| f.headline.contains("copy.sh") && f.headline.contains(".bak"))
+        .collect();
+    let Some(old) = old.first() else {
+        return Err("the old defect in lib/copy.sh is not reported as a finding".into());
+    };
+    if blocking(&old.headline) || !nonblocking(&old.headline) {
+        return Err(format!(
+            "the old defect is not nonblocking: {}",
+            old.headline
+        ));
+    }
+    if !has_any(&old.body, &["serious", "severe", "critical", "major"]) {
+        return Err(format!(
+            "the old defect's seriousness is not stated: {}",
+            old.headline
+        ));
+    }
+    Ok(())
 }
 
-/// The block mentioning `token`, if any: first one that does.
-fn block_with<'a>(all: &'a [String], tokens: &[&str]) -> Option<&'a String> {
-    all.iter().find(|b| tokens.iter().any(|t| b.contains(t)))
+/// Probe 2's verdict: the false item-3 claim and the defective support
+/// script block; the accepted soak run and the jitter demand do not.
+fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), String> {
+    if outcome != "changes_requested" {
+        return Err(format!("outcome {outcome}"));
+    }
+    if !summary.contains(head) {
+        return Err(format!("the summary doesn't name the full HEAD SHA {head}"));
+    }
+    let all = findings(summary);
+    let about = |token: &'static str| all.iter().filter(move |f| f.body.contains(token));
+    if !about("HTTP_RETRY_MAX").any(|f| blocking(&f.headline)) {
+        return Err("item 3 (claimed resolved, not done) does not block".into());
+    }
+    if !about("verify-backoff").any(|f| blocking(&f.headline)) {
+        return Err("the defective support script does not block".into());
+    }
+    for token in ["soak", "jitter", "Jitter", "JITTER"] {
+        if let Some(f) = all
+            .iter()
+            .find(|f| f.headline.contains(token) && blocking(&f.headline))
+        {
+            return Err(format!("a revived requirement blocks: {}", f.headline));
+        }
+    }
+    Ok(())
 }
 
 fn assert_bounded(contexts: &[Value]) {
@@ -953,42 +1098,10 @@ async fn probe_mixed_rereview() {
         "the previous review was never looked up: {:?}",
         out.contexts
     );
-    assert_eq!(outcome, "changes_requested");
     let head = scenario.commits.last().unwrap();
-    assert!(
-        summary.contains(head),
-        "the summary doesn't name the full HEAD SHA {head}"
-    );
-    let findings = summary
-        .split_once("Findings")
-        .map(|(_, rest)| rest.to_string())
-        .unwrap_or_else(|| summary.clone());
-    let b = blocks(&findings);
-    // The earlier blocker (DEST still created) blocks.
-    let earlier = block_with(&b, &["mkdir", "creates DEST", "created"])
-        .expect("the unresolved earlier blocker is not reported");
-    assert!(
-        !nonblocking(earlier),
-        "the unresolved earlier blocker was made nonblocking:\n{earlier}"
-    );
-    // The regression the corrections introduced blocks.
-    let regression = block_with(&b, &["break", "-v"])
-        .expect("the correction-introduced regression is not reported");
-    assert!(
-        !nonblocking(regression),
-        "the regression was made nonblocking:\n{regression}"
-    );
-    // The old defect in the unchanged callee is prominent, serious and nonblocking.
-    let old = block_with(&b, &["copy.sh", ".bak"])
-        .expect("the old defect in lib/copy.sh is not reported");
-    assert!(
-        nonblocking(old),
-        "the old defect was not marked nonblocking:\n{old}"
-    );
-    assert!(
-        has_any(old, &["serious", "high", "severe", "critical", "major"]),
-        "the old defect's seriousness was not stated:\n{old}"
-    );
+    if let Err(why) = check_mixed_rereview(&outcome, &summary, head) {
+        panic!("{why}");
+    }
     assert_eq!(out.status, "closed");
 }
 
@@ -1019,52 +1132,9 @@ async fn probe_human_scoped_round() {
         "the human's hand-off was never retrieved: {:?}",
         out.contexts
     );
-    assert_eq!(outcome, "changes_requested");
     let head = scenario.commits.last().unwrap();
-    assert!(
-        summary.contains(head),
-        "the summary doesn't name the full HEAD SHA"
-    );
-    let findings = summary
-        .split_once("Findings")
-        .map(|(_, rest)| rest.to_string())
-        .unwrap_or_else(|| summary.clone());
-    let b = blocks(&findings);
-    // Item 3 was claimed resolved by a commit that doesn't touch it: blocks.
-    let item3 = block_with(&b, &["HTTP_RETRY_MAX", "README"])
-        .expect("item 3's false resolution claim is not reported");
-    assert!(
-        !nonblocking(item3),
-        "item 3 was not treated as blocking:\n{item3}"
-    );
-    // The defective support script introduced in the corrections blocks.
-    let script =
-        block_with(&b, &["verify-backoff"]).expect("the defective support script is not reported");
-    assert!(
-        !nonblocking(script),
-        "the support script defect was made nonblocking:\n{script}"
-    );
-    // The accepted soak run and the human-superseded jitter demand are not work orders.
-    for token in ["soak", "jitter", "RETRY_JITTER"] {
-        for block in b.iter().filter(|b| b.contains(token)) {
-            assert!(
-                nonblocking(block)
-                    || has_any(
-                        block,
-                        &[
-                            "accept",
-                            "waive",
-                            "not required",
-                            "out of scope",
-                            "dismiss",
-                            "superseded",
-                            "not a work order",
-                            "not block"
-                        ]
-                    ),
-                "a revived requirement ({token}) blocks:\n{block}"
-            );
-        }
+    if let Err(why) = check_human_round(&outcome, &summary, head) {
+        panic!("{why}");
     }
     assert_eq!(out.status, "closed");
 }
