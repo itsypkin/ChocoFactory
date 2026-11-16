@@ -587,10 +587,10 @@ fn probe_workflow(turn: Turn) -> (String, Vec<&'static str>) {
     let on = if role == "reviewer" {
         "{ approved: finished, changes_requested: finished }"
     } else {
-        "{ done: finished, blocked: finished }"
+        "{ done: hold, blocked: hold }"
     };
     let yaml = format!(
-        "name: probe\nworktree: true\nroles:\n  {role}:\n    cli: claude\n    model: {model}\n    system_prompt_file: {system}\n{extra}stages:\n  begin:\n    kind: human_gate\n    capture: text\n    markers:\n      - line: /go\n        then: go\n    on: {{ go: {stage} }}\n  {stage}:\n    kind: agent_turn\n    role: {role}\n    prompt_file: {prompt}\n    capture: json\n{sections}    on: {on}\n  finished:\n    kind: terminal\n"
+        "name: probe\nworktree: true\nroles:\n  {role}:\n    cli: claude\n    model: {model}\n    system_prompt_file: {system}\n{extra}stages:\n  hold:\n    kind: human_gate\n    capture: text\n    markers:\n      - line: /go\n        then: go\n    on: {{ go: finished }}\n  begin:\n    kind: human_gate\n    capture: text\n    markers:\n      - line: /go\n        then: go\n    on: {{ go: {stage} }}\n  {stage}:\n    kind: agent_turn\n    role: {role}\n    prompt_file: {prompt}\n    capture: json\n{sections}    on: {on}\n  finished:\n    kind: terminal\n"
     );
     (yaml, vec![system, prompt])
 }
@@ -883,7 +883,13 @@ async fn run_turn(server: &TestServer, id: &str) -> Outcome {
     let status = loop {
         let task = server.get(&format!("/tasks/{id}")).await.json();
         let status = task["status"].as_str().unwrap_or("").to_string();
-        if matches!(status.as_str(), "closed" | "stuck" | "cancelled") {
+        // A coder's worktree is kept while the task waits at `hold`; a
+        // reviewer's ends at `finished`, which removes it.
+        let held = task["stage_trail"]
+            .as_array()
+            .and_then(|trail| trail.last())
+            .is_some_and(|entry| entry["payload"]["stage"] == "hold");
+        if held || matches!(status.as_str(), "closed" | "stuck" | "cancelled") {
             break status;
         }
         if std::time::Instant::now() > deadline {
@@ -1308,5 +1314,5 @@ async fn probe_coder_item_mapping() {
         );
     }
     assert_eq!(out.context_errors, 0);
-    assert_eq!(out.status, "closed");
+    assert_eq!(out.status, "open", "the coder did not leave the stage");
 }

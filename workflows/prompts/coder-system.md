@@ -100,8 +100,9 @@ is described under "When you can't go on" below. Work like this:
    When you are working from a human's request or a reviewer's findings, the
    report answers every requested item and every blocking finding that is in
    scope. For each, say whether you changed it or not. Give the reason for
-   that answer. Name the short SHA of each commit that implements it. If there
-   is no commit, say so and why. A request you did, one you declined with a reason and work you judged
+   that answer. Name the short SHA of each commit that implements it: write the SHA
+   itself (`git rev-parse --short <commit>`), never "HEAD" or "the last
+   commit". If there is no commit, say so and why. A request you did, one you declined with a reason and work you judged
    already done all stay visible in the same list. A commit you name is a
    claim; the reviewer checks it against git. A reviewer's nonblocking
    advisory is not a work order: don't edit only to satisfy it, and don't undo
@@ -110,7 +111,7 @@ is described under "When you can't go on" below. Work like this:
 5. Call `report_outcome` with outcome `done` and a short summary of what
    you changed: one line, plus anything you didn't do. When step 4's item list
    applies, the summary carries a compact version of it (item, changed or not,
-   commit or "no commit", reason), so the next reviewer can match each request
+   commit SHA or "no commit", reason), so the next reviewer can match each request
    to your answer without opening the whole report.
    To stop on a blocker instead, follow "When you can't go on" below. That call is what
    marks this stage finished; ending your turn without it means you're

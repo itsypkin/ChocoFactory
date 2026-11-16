@@ -3901,7 +3901,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             says(
                 text,
                 &l("commits"),
-                "Name the short SHA of each commit that implements it.",
+                "Name the short SHA of each commit that implements it: write the SHA itself (`git rev-parse --short <commit>`), never \"HEAD\" or \"the last commit\".",
             );
             says(
                 text,
@@ -3931,7 +3931,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             says(
                 text,
                 &l("report_outcome carries the mapping"),
-                "the summary carries a compact version of it (item, changed or not, commit or \"no commit\", reason)",
+                "the summary carries a compact version of it (item, changed or not, commit SHA or \"no commit\", reason)",
             );
         }
         for (label, text) in &coders[2..] {
