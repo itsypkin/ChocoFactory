@@ -4882,3 +4882,131 @@ async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports
     a.reply(&server, "approved").await;
     assert_eq!(a.results.len(), 2);
 }
+
+/// A read that outlasts the driver's request timeout is a visible tool
+/// error (not an empty answer), writes nothing, and the turn goes on to
+/// report: the stalled daemon holds the lookup for the whole call.
+#[tokio::test(flavor = "multi_thread")]
+async fn omp_a_stalled_read_times_out_as_an_error_and_the_turn_still_reports() {
+    use crate::context_tool_tests::*;
+    let (server, project) = server_with_flow().await;
+    let mut a = new_task(&server, &project, "A", &[]).await;
+    a.reply(&server, "again").await;
+    let held = held_lookup_daemon(server.pool().clone()).await;
+    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &held.base).unwrap();
+    let before = crate::test_support::dump_tables(server.pool()).await;
+
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        {"op": "context", "args": {"source": "stage", "stage": "gate"}, "label": "c"},
+        s_report("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let adapter = adapter.with_context_timeout(Duration::from_millis(300));
+    let cfg = RoleConfig {
+        context: Some(binding),
+        ..env.cfg()
+    };
+    let mut handle = adapter.start("go", &cfg).unwrap();
+    held.wait_until_held().await;
+    script.wait_log("script_done").await;
+    let events = drain(&mut handle).await;
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolResult {
+                tool,
+                is_error,
+                output,
+                ..
+            } if *tool == qualified_get_context_tool_name() => Some((*is_error, output.clone())),
+            _ => None,
+        })
+        .expect("the stalled call was answered");
+    assert!(result.0, "a timeout is an error, not an answer: {}", result.1);
+    assert!(
+        !result.1.contains("provenance"),
+        "no answer was invented: {}",
+        result.1
+    );
+    assert!(script.lines().contains(&"context_result:c:error".to_string()));
+    assert!(
+        script
+            .lines()
+            .contains(&"host_result:0:accepted".to_string()),
+        "the report after it was still accepted"
+    );
+    held.release();
+    held.wait_until_the_read_is_released().await;
+    assert_eq!(
+        crate::test_support::dump_tables(server.pool()).await,
+        before
+    );
+}
+
+/// The model's own process stops listening while a read is pending, so the
+/// answer cannot be delivered: the call is logged as an error that says so,
+/// not as the answer the daemon gave, and nothing is accepted or written.
+#[tokio::test(flavor = "multi_thread")]
+async fn omp_an_answer_that_cannot_be_delivered_is_logged_as_an_error() {
+    use crate::context_tool_tests::*;
+    let (server, project) = server_with_flow().await;
+    let mut a = new_task(&server, &project, "A", &[]).await;
+    a.reply(&server, "again").await;
+    let binding =
+        ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
+    let before = crate::test_support::dump_tables(server.pool()).await;
+
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        {"op": "context", "args": {"source": "task"}, "label": "c", "close_stdin": true},
+        s_report("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let cfg = RoleConfig {
+        context: Some(binding),
+        ..env.cfg()
+    };
+    let mut handle = adapter.start("go", &cfg).unwrap();
+    // Events up to the call's result; the fixture keeps the process alive
+    // until released.
+    let mut events = Vec::new();
+    let result = loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), handle.recv())
+            .await
+            .expect("timed out waiting for the call's result")
+            .expect("the stream ended before the call's result");
+        if let AgentEvent::ToolResult {
+            tool,
+            is_error,
+            output,
+            ..
+        } = &event
+            && *tool == qualified_get_context_tool_name()
+        {
+            break (*is_error, output.clone());
+        }
+        events.push(event);
+    };
+    assert!(result.0, "{}", result.1);
+    assert_eq!(result.1, "omp could not be sent the reply to get_context");
+    assert!(!result.1.contains(&a.title), "the daemon's answer is not shown as delivered");
+    std::fs::write(script.gates.join("context-undelivered-seen"), "").unwrap();
+    events.extend(drain(&mut handle).await);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, is_error: false, .. }
+                if *tool == chocofactory_core::mcp::qualified_report_outcome_tool_name()
+        )),
+        "no report was accepted: {events:?}"
+    );
+    assert_eq!(
+        crate::test_support::dump_tables(server.pool()).await,
+        before
+    );
+}

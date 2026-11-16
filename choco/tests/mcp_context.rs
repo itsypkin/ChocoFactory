@@ -391,3 +391,48 @@ async fn sigint_during_a_pending_read_ends_the_server_and_a_later_one_works() {
     assert_eq!(run.replies[1]["result"]["isError"], json!(false));
     assert!(run.status.success());
 }
+
+/// A successful read between the first two thin reports leaves the
+/// rejection allowance alone: the second thin report is still rejected (two
+/// are) and the third accepted, exactly as with no read at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_read_between_thin_reports_does_not_spend_the_allowance() {
+    let daemon = daemon().await;
+    let mut args = vec![
+        "--outcome".to_string(),
+        "approved".to_string(),
+        "--require-section".to_string(),
+        "Findings".to_string(),
+    ];
+    args.extend(binding_args(&daemon.base));
+    let thin = |id| {
+        call(
+            id,
+            "report_outcome",
+            json!({"outcome": "approved", "summary": "no sections"}),
+        )
+    };
+    let run = serve(
+        &args,
+        &[],
+        &[
+            thin(1),
+            call(2, "get_context", json!({"source": "task"})),
+            thin(3),
+            thin(4),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let is_error = |index: usize| run.replies[index]["result"]["isError"].clone();
+    assert_eq!(is_error(0), json!(true), "first thin report");
+    assert_eq!(is_error(1), json!(false), "the read itself succeeded");
+    assert!(
+        run.replies[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"title\":\"T\"")
+    );
+    assert_eq!(daemon.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(is_error(2), json!(true), "second thin report is still rejected");
+    assert_eq!(is_error(3), json!(false), "third thin report is accepted");
+}

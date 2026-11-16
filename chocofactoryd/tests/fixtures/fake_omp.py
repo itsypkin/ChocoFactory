@@ -83,7 +83,7 @@ wrapper script, never through the test process's own environment):
   until that gate file exists, and then reports the totals of that moment) /
   assistant {text, usage, counted, stop_reason, error_message, error_status}
   / report {args} (a real host call under fresh ids; waits for the reply) /
-  context {args | no_args, label, cancel?} (a real `get_context` host call under fresh ids,
+  context {args | no_args, label, cancel?, close_stdin?} (a real `get_context` host call under fresh ids,
   waits for the reply and logs `context_result:<label>:ok|error`) /
   native_tool {name} (an ordinary, non-host tool call and its result, as a
   model's own `read` would produce) /
@@ -699,7 +699,7 @@ def wait_for(path, what):
 ABSENT = object()
 
 
-def script_context(args, label, cancel=False):
+def script_context(args, label, cancel=False, close_stdin=False):
     n = STATE.context_n
     STATE.context_n += 1
     call_id = "call-context-%d" % n
@@ -714,6 +714,17 @@ def script_context(args, label, cancel=False):
     if cancel:
         # The model gave up on the call while it is still being answered.
         emit({"type": "host_tool_cancel", "id": host_id})
+    if close_stdin:
+        # The child's end of the host's pipe goes away while the call is
+        # pending, so the host's reply cannot be delivered. Stay alive until
+        # the test says the host has dealt with it, then leave.
+        os.close(0)
+        deadline = time.time() + 60
+        while not os.path.exists(gate_path("context-undelivered-seen")):
+            if time.time() > deadline:
+                sys.exit(3)
+            time.sleep(0.05)
+        sys.exit(0)
     while True:
         frame = read_frame()
         if frame is None:
@@ -826,7 +837,8 @@ def run_script():
         elif op == "report":
             script_report(step["args"])
         elif op == "context":
-            script_context(ABSENT if step.get("no_args") else step.get("args"), step.get("label", "0"), step.get("cancel", False))
+            script_context(ABSENT if step.get("no_args") else step.get("args"), step.get("label", "0"), step.get("cancel", False),
+                           step.get("close_stdin", False))
         elif op == "native_tool":
             script_native_tool(step["name"])
         elif op == "prompt_result":

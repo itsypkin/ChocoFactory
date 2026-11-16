@@ -94,6 +94,8 @@ pub struct OmpAdapter {
     state_dir: PathBuf,
     /// How long a memory role's `/memory stats` check may take.
     memory_check_timeout: Duration,
+    /// How long one `get_context` read may take.
+    context_timeout: Duration,
     /// The `HOME` the omp child sees: omp prints a path under it as `~/…`.
     home: Option<PathBuf>,
     /// Test stand-in for the daemon's inherited environment (see
@@ -127,6 +129,13 @@ impl OmpAdapter {
         self
     }
 
+    /// Overrides how long one `get_context` read may take (tests use a short
+    /// one; a launch otherwise gets the shared 30 seconds).
+    pub fn with_context_timeout(mut self, timeout: Duration) -> Self {
+        self.context_timeout = timeout;
+        self
+    }
+
     /// Overrides the memory check's deadline (tests use a short one).
     pub fn with_memory_check_timeout(mut self, timeout: Duration) -> Self {
         self.memory_check_timeout = timeout;
@@ -143,6 +152,7 @@ impl OmpAdapter {
             binary: binary.into(),
             state_dir: state_dir.into(),
             memory_check_timeout: REQUEST_TIMEOUT,
+            context_timeout: context_tool::REQUEST_TIMEOUT,
             home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(test)]
             parent_env: Vec::new(),
@@ -220,7 +230,7 @@ impl OmpAdapter {
         let context = cfg
             .context
             .clone()
-            .map(ContextClient::new)
+            .map(|binding| ContextClient::with_timeout(binding, self.context_timeout))
             .transpose()
             .map_err(|message| AdapterError::Spawn(std::io::Error::other(message)))?;
 
