@@ -4720,6 +4720,7 @@ async fn both_surfaces_show_a_daemon_failure_as_a_tool_error_never_as_an_empty_a
                 &{
                     let mut body: Value = serde_json::from_str(&result_body).unwrap();
                     body["task_id"] = json!("ANOTHER-TASK");
+                    body["result"]["task_id"] = json!("ANOTHER-TASK");
                     body.to_string()
                 },
             )

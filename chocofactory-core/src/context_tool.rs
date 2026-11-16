@@ -1220,7 +1220,11 @@ mod tests {
             (
                 "answer about another task than the bound one",
                 200,
-                with(stage_result_body("x"), &["task_id"], json!("ANOTHER-TASK")),
+                with(
+                    with(stage_result_body("x"), &["task_id"], json!("ANOTHER-TASK")),
+                    &["result", "task_id"],
+                    json!("ANOTHER-TASK"),
+                ),
             ),
             (
                 "typed 404 about another task",
