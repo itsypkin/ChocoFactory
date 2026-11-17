@@ -22,8 +22,9 @@ Read this while watching a task, when its behaviour surprises you.
 - **coding / revising.** The coder's turn is complete when
   it has called `report_outcome` and its run then ends cleanly, and the
   process exits and is cleaned up; the call alone does not complete it, and
-  neither does stopping output. Its prompt carries only the title and the
-  arrival: the task text (or the planner's report) and, on `revising`, the
+  neither does stopping output. The initial coder turn's prompt
+  carries only the title and the closing issues, with no arrival; a revision
+  turn's carries the title, the closing issues and the arrival. The task text (or the planner's report) and, on `revising`, the
   reviewer's report, your hand-offs and its own earlier reports are read with
   `get_context`, by following the result links from where the turn started.
   When it can't read what it essentially needs, it reports `blocked` naming

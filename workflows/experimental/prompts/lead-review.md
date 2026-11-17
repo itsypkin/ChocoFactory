@@ -46,8 +46,8 @@ report is the `summary` inside its capture; a human's capture is text.
    `spec_questions` with `resumed`. A `revising` result reached from a review, a
    check or a human gate that asked for changes is not on it, and no result in
    it left a review, a check or such a gate. Such
-   answers amend the requirements and the whole branch stays in scope unless
-   their own text narrows it; an empty boundary or a gap is not that proof.
+   answers amend the requirements and accepted costs stay accepted, but the whole
+   branch stays in scope whatever they say; an empty boundary or a gap is not that proof.
 
 ## The reviewers' reports
 

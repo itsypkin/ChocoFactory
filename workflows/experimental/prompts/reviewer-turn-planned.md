@@ -66,9 +66,9 @@ d) Which round it is, from what you found:
      check or a human gate that asked for changes is not. No result in it left a
      review, a check or a human gate that asked for changes. Then there is no earlier
      lead report and that is fine. The human's answers inside that path amend the
-     requirements: apply them to the full review of the whole branch, and
-     don't treat them as a narrowed round unless their own text narrows it
-     (for example "change nothing else"). A root that is a revising or check
+     requirements, and accepted costs stay accepted: apply them to the full
+     review of the whole branch. With no earlier review of yours, no answer
+     narrows it, whatever it says (for example "change nothing else"). A root that is a revising or check
      result, an empty boundary, an `unavailable` answer or a pruned parent
      (`history_gap`) is **not** that evidence.
    - **A human's round** when a governing human request exists that is not an

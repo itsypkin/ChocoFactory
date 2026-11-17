@@ -4158,8 +4158,18 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             );
             says(
                 text,
-                &l("their answers amend the requirements, they don't narrow the review"),
-                "apply them to the full review of the whole branch, and don't treat them as a narrowed round unless their own text narrows it",
+                &l("their answers amend the requirements and accepted costs stay accepted"),
+                "requirements, and accepted costs stay accepted: apply them to the full review of the whole branch.",
+            );
+            says(
+                text,
+                &l("no answer narrows a first review"),
+                "With no earlier review of yours, no answer narrows it, whatever it says",
+            );
+            says_not(
+                text,
+                &l("a narrowing exception for the answer's own text"),
+                "unless their own text narrows it",
             );
             says(
                 text,
@@ -4191,7 +4201,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         says(
             &lead,
             "lead: initial-path answers amend a first lap",
-            "Such answers amend the requirements and the whole branch stays in scope unless their own text narrows it;",
+            "Such answers amend the requirements and accepted costs stay accepted, but the whole branch stays in scope whatever they say;",
+        );
+        says_not(
+            &lead,
+            "lead: a narrowing exception for the answer's own text",
+            "unless their own text narrows it",
         );
         says(
             &lead,
