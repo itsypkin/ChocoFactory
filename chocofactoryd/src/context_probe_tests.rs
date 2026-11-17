@@ -1678,7 +1678,18 @@ fn the_coder_item_checks_accept_an_answer_only_for_its_own_item() {
                 .replace("(F1) changed, commit 2222222: the subject is quoted.", "(F1) commit 2222222 (see above)."),
         ),
         (
-            "a changed answer that opens with a bare commit pointer and a reason",
+            "a changed answer whose only reason is 'see above'",
+            right
+                .replace(
+                    "(H1) changed, commit 1111111: exits 2 when SUBJECT is missing.",
+                    "(H1) changed, commit 1111111 (see above).",
+                )
+                .replace(
+                    "(F1) changed, commit 2222222: the subject is quoted.",
+                    "(F1) changed, commit 2222222 (see above).",
+                ),
+        ),
+        (            "a changed answer that opens with a bare commit pointer and a reason",
             right.replace(
                 "(H1) changed, commit 1111111:",
                 "(H1) commit 1111111:",
