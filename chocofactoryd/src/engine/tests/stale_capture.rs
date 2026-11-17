@@ -75,7 +75,7 @@ async fn wait_for_review_runs(pool: &SqlitePool, task_id: &str, n: usize) -> Vec
 }
 
 /// What a session was actually sent, as the scripted agent echoed it back.
-async fn delivered_to(pool: &SqlitePool, session_id: &str) -> String {
+pub(super) async fn delivered_to(pool: &SqlitePool, session_id: &str) -> String {
     crate::test_support::wait_until("the echoed prompt", || async {
         let text = events::list_for_session(pool, session_id)
             .await

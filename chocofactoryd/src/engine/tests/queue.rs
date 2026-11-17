@@ -3277,3 +3277,98 @@ async fn a_paused_tasks_queued_row_costs_the_dispatcher_one_pass_per_tick() {
     let passes = q.engine.turn_gate().passes() - before;
     assert!(passes <= 2, "{passes} passes in two ticks");
 }
+
+// #353: a turn that waited in the queue is prepared again when it is admitted,
+// so its previous capture must survive the wait and reach that prompt, and
+// only then be cleared.
+#[tokio::test]
+async fn queued_admission_renders_old_self_capture_then_clears() {
+    let q = Q::new(Some(1)).await;
+    fs::write(
+        &q.flow,
+        FLOW.replace(
+            "    role: coder\n",
+            "    role: coder\n    prompt_file: qcoding.md\n    capture: json\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        q.dir.join("qcoding.md"),
+        "job {{ task.input }}\nearlier: [{{ stages.coding.summary }}]\n",
+    )
+    .unwrap();
+    let old = "QUEUED-OLD-SUMMARY line one\nline two\n";
+    let mut script = serde_json::Map::new();
+    script.insert(
+        "job-a".to_string(),
+        json!(held(&q.dir, "job-a", Ending::Report)),
+    );
+    script.insert(
+        "job-b".to_string(),
+        json!([
+            {"op": "echo_turn"},
+            {"op": "run", "command": format!("touch '{}'", q.dir.join("started-job-b").display())},
+            {"op": "wait_file", "path": q.dir.join("release-job-b").display().to_string()},
+            {"op": "report", "outcome": "done"},
+            {"op": "result"},
+        ]),
+    );
+    fs::write(
+        q.dir.join("fake-claude-queue.json"),
+        json!({ "by_prompt": script }).to_string(),
+    )
+    .unwrap();
+    q.names
+        .lock()
+        .unwrap()
+        .extend(["job-a".to_string(), "job-b".to_string()]);
+
+    q.create("job-a").await;
+    q.wait_started("job-a").await;
+    let b = q.create("job-b").await;
+    q.wait_rows(1).await;
+
+    // The task's earlier verdict, as a loop back into this stage would leave it.
+    let state = workflow_state::get(&q.pool, &b.id).await.unwrap().unwrap();
+    let mut payload = state.payload.clone();
+    payload["stages"] = json!({
+        "coding": {"outcome": "again", "summary": old},
+        "elsewhere": "OTHER-STAGE-KEPT",
+    });
+    payload["current_result_id"] = json!("result-pointer");
+    workflow_state::update(
+        &q.pool,
+        &b.id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage,
+            stage_kind: state.stage_kind.unwrap(),
+            loop_counters: state.loop_counters,
+            payload: payload.clone(),
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Still waiting: no session, no agent, and the previous run's capture is
+    // still there (nothing has started yet that it could be mistaken for).
+    q.assert_not_started("job-b").await;
+    assert!(q.sessions(&b.id).await.is_empty());
+    assert_eq!(payload_of(&q.pool, &b.id).await, payload);
+
+    q.release("job-a");
+    q.wait_started("job-b").await;
+    let session = q.sessions(&b.id).await.remove(0);
+    let delivered = super::stale_capture::delivered_to(&q.pool, &session.id).await;
+    assert!(
+        delivered.contains(old),
+        "the admitted turn was not sent its own earlier summary: {delivered}"
+    );
+    let after = payload_of(&q.pool, &b.id).await;
+    assert_eq!(
+        after["stages"],
+        json!({"elsewhere": "OTHER-STAGE-KEPT"}),
+        "the admitted turn's old capture is still live, or another stage's was removed"
+    );
+    assert_eq!(after["current_result_id"], json!("result-pointer"));
+}
