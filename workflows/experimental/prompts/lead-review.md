@@ -37,10 +37,12 @@ report is the `summary` inside its capture; a human's capture is text.
    `changes_requested`, say exactly which lookup, result or link is unavailable
    and why, and don't loop on the lookup. A fresh first lap is only proven by a
    chain that, followed to its start, holds just the initial path: the `coding`
-   results (more than one when a `blocked` one was answered by `blocker` with
-   `resumed`) and the planning results before them, including a `needs_input`
-   answered by `spec_questions` with `resumed`, with no result that left
-   `revising`, a review, a check or a human gate that asked for changes. Such
+   results and, when a `blocked` one was answered by `blocker` with `resumed`,
+   the `revising` results that answer led to (all before any review), and the
+   planning results before them, including a `needs_input` answered by
+   `spec_questions` with `resumed`. A `revising` result reached from a review, a
+   check or a human gate that asked for changes is not on it, and no result in
+   it left a review, a check or such a gate. Such
    answers amend the requirements and the whole branch stays in scope unless
    their own text narrows it; an empty boundary or a gap is not that proof.
 

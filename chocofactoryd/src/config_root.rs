@@ -4137,8 +4137,25 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             );
             says(
                 text,
-                &l("a pre-review blocker answer stays on the initial path"),
-                "more than one when a `blocked` one was answered by `blocker` with `resumed`",
+                &l("direct coding is the initial path"),
+                "The initial path is the `coding` results and,",
+            );
+            says(
+                text,
+                &l(
+                    "a pre-review blocker answer and the revising it led to stay on the initial path",
+                ),
+                "when a `blocked` one was answered by `blocker` with `resumed`, the `revising` results that answer led to (one or several such cycles, all before any review)",
+            );
+            says(
+                text,
+                &l("a revising reached from a review, check or human gate is a correction"),
+                "A `revising` result is on it only when it was reached from such a `blocker` answer; one reached from a review, a check or a human gate that asked for changes is not.",
+            );
+            says(
+                text,
+                &l("only a result that left a review or change-asking gate ends the initial path"),
+                "No result in it left a review, a check or a human gate that asked for changes.",
             );
             says(
                 text,
@@ -4184,13 +4201,80 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         );
         says(
             &lead,
-            "lead: a pre-review blocker answer is on the initial path",
-            "more than one when a `blocked` one was answered by `blocker` with `resumed`",
+            "lead: a pre-review blocker answer and its revising are on the initial path",
+            "when a `blocked` one was answered by `blocker` with `resumed`, the `revising` results that answer led to (all before any review)",
+        );
+        says(
+            &lead,
+            "lead: a revising reached from a review, check or gate is a correction",
+            "A `revising` result reached from a review, a check or a human gate that asked for changes is not on it",
         );
         says(
             &lead,
             "lead: a human's round excludes initial-path answers",
             "A human's round (a governing request that is not an initial-path answer):",
+        );
+    }
+
+    /// The first-review rule's initial path is the routes the workflows
+    /// really have: a coding or revising `blocked` goes to `blocker`, its
+    /// `resumed` goes to `revising`, and a finished revising goes to the
+    /// review. The prompts name the `revising` that follows an initial
+    /// blocker answer; a review-started `revising` differs only by what
+    /// it was reached from.
+    #[test]
+    fn initial_path_matches_the_workflow_routes() {
+        let (_dir, mut defs) = coding_workflows();
+        defs.push(
+            crate::workflow_def::WorkflowDefinition::load(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../workflows/experimental/review-panel.yaml"),
+            )
+            .unwrap(),
+        );
+        for def in &defs {
+            let wf = def.name.as_str();
+            let route = |stage: &str, outcome: &str| {
+                on_map(&def.stages[stage])
+                    .into_iter()
+                    .find(|(k, _)| *k == outcome)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_else(|| panic!("{wf}: {stage} has no {outcome} route"))
+            };
+            assert_eq!(
+                route("coding", "blocked"),
+                "blocker",
+                "{wf}: coding blocked"
+            );
+            assert_eq!(
+                route("revising", "blocked"),
+                "blocker",
+                "{wf}: revising blocked"
+            );
+            assert_eq!(
+                route("blocker", "resumed"),
+                "revising",
+                "{wf}: a blocker answer resumes into revising, so a pre-review revising exists"
+            );
+            let review = if wf.contains("panel") {
+                "review_panel"
+            } else {
+                "internal_review"
+            };
+            assert_eq!(route("revising", "done"), review, "{wf}: revising done");
+        }
+        // The planned ones also route a planning question through a gate.
+        let planned = &defs[1];
+        assert_eq!(
+            on_map(&planned.stages["spec_check"])
+                .into_iter()
+                .find(|(k, _)| *k == "needs_input")
+                .map(|(_, v)| v),
+            Some("spec_questions")
+        );
+        assert_eq!(
+            on_map(&planned.stages["spec_questions"]),
+            [("resumed", "spec_check")]
         );
     }
 

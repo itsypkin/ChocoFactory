@@ -914,7 +914,10 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
         ),
         (
             "soak revived",
-            human.replace("3. nonblocking: the soak", "3. BLOCKING: the soak"),
+            human.replace(
+                "3. nonblocking: the soak run was accepted by the human, not required.",
+                "3. BLOCKING: the 12-hour soak run was not made.",
+            ),
         ),
         (
             // The word "soak" is in the body, not the headline.
@@ -922,6 +925,22 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
             human.replace(
                 "3. nonblocking: the soak run was accepted by the human, not required.",
                 "3. BLOCKING scripts/run-all.sh: no proof of the retry loop.\n- the 12-hour soak run was never made.",
+            ),
+        ),
+        (
+            // The support script is named, but not for its defect: it asks
+            // for the soak run the human accepted not making.
+            "support script finding that revives the accepted soak run",
+            human.replace(
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+                "2. BLOCKING scripts/verify-backoff.sh: the required 12-hour soak run was not made; run it before approval.",
+            ),
+        ),
+        (
+            "README finding that revives the accepted soak run",
+            human.replace(
+                "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.",
+                "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n- also the soak run is still required.",
             ),
         ),
         (
@@ -1184,12 +1203,18 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
             f.headline
         ));
     }
+    // The support script blocks for its own defect (it recomputes the delays
+    // instead of calling the real function), not for any other reason a
+    // finding about the same file can give.
     let script: Vec<&Finding> = all
         .iter()
         .filter(|f| f.headline.contains("verify-backoff"))
         .collect();
-    if !script.iter().any(|f| blocking(&f.headline)) {
-        return Err("the defective support script does not block".into());
+    if !script
+        .iter()
+        .any(|f| blocking(&f.headline) && has_any(&f.body, &["recompute", "retry_delay"]))
+    {
+        return Err("the defective support script does not block for its own defect".into());
     }
     if let Some(f) = script.iter().find(|f| !blocking(&f.headline)) {
         return Err(format!(
@@ -1197,12 +1222,27 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
             f.headline
         ));
     }
+    // No blocking finding, whatever file it names, demands the accepted soak
+    // run or the jitter: a line that mentions one must also say it was
+    // accepted or declined.
+    const ACCEPTED: [&str; 8] = [
+        "accept",
+        "not required",
+        "waive",
+        "declin",
+        "instruct",
+        "not demand",
+        "no longer",
+        "out of scope",
+    ];
     for f in all.iter().filter(|f| blocking(&f.headline)) {
-        let about_work = has_any(&f.headline, &["verify-backoff"])
-            || has_any(&f.headline, &["readme", "retry_max", "item 3"])
-                && f.body.contains("RETRY_MAX");
-        if !about_work && has_any(&f.body, &["soak", "jitter"]) {
-            return Err(format!("a revived requirement blocks: {}", f.headline));
+        for line in f.body.lines() {
+            if has_any(line, &["soak", "jitter"]) && !has_any(line, &ACCEPTED) {
+                return Err(format!(
+                    "a revived requirement blocks ({}): {line}",
+                    f.headline
+                ));
+            }
         }
     }
     Ok(())
@@ -1250,48 +1290,72 @@ fn names_a_commit(answer: &str, shas: &[String]) -> bool {
     shas.iter().any(|sha| answer.contains(&sha[..7]))
 }
 
-/// An answer that opens by saying the item was not changed, and claims no
-/// commit: the literal words "no commit" are one way to say it, not the only
-/// one, but "changed: added it today; it was not done yesterday" is not one.
-fn answers_not_changed(answer: &str, shas: &[String]) -> bool {
-    NOT_CHANGED.iter().any(|p| answer.starts_with(p)) && !names_a_commit(answer, shas)
+/// Words that give an answer's reason: what is left of it once the commit
+/// ids and the words of the disposition itself are taken out.
+fn reason_words(answer: &str) -> usize {
+    const FILLER: [&str; 9] = [
+        "changed", "change", "done", "fixed", "commit", "commits", "not", "and", "the",
+    ];
+    answer
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .filter(|w| !(w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit())))
+        .filter(|w| !FILLER.contains(w))
+        .count()
 }
 
-/// An answer that does not open with "not changed" and names a real commit.
-fn answers_changed(answer: &str, commits_for_the_item: &[String]) -> bool {
-    !NOT_CHANGED.iter().any(|p| answer.starts_with(p))
-        && names_a_commit(answer, commits_for_the_item)
+const MIN_REASON_WORDS: usize = 2;
+
+/// One item's answers in a text. EVERY line that answers it must agree: a
+/// changed item is answered only as changed, each answer naming a real commit
+/// touching its file and giving a reason; an unchanged item only as not
+/// changed, each answer opening with that, naming no commit and giving a
+/// reason. One acceptable line cannot cancel a contradicting one.
+fn check_item(
+    text: &str,
+    item: &str,
+    changed: bool,
+    real: &[String],
+    all: &[String],
+) -> Result<(), String> {
+    let answers = item_answers(text, item);
+    if answers.is_empty() {
+        return Err(format!("{item}: no line answers it"));
+    }
+    for a in &answers {
+        let says_not_changed = NOT_CHANGED.iter().any(|p| a.starts_with(p));
+        if changed {
+            if says_not_changed || !names_a_commit(a, real) {
+                return Err(format!(
+                    "{item}: answered as changed, but this line is not a changed answer naming a real commit touching its file ({real:?}): {a}"
+                ));
+            }
+        } else if !says_not_changed || names_a_commit(a, all) {
+            return Err(format!(
+                "{item}: answered as not changed, but this line is not a not-changed answer without a commit: {a}"
+            ));
+        }
+        if reason_words(a) < MIN_REASON_WORDS {
+            return Err(format!("{item}: this answer gives no reason: {a}"));
+        }
+    }
+    Ok(())
 }
 
 /// The coder's item mapping, in one text (the work report, or the
 /// report_outcome summary): H1 and F1 changed, each naming a real commit that
 /// touches its own file; H2 and F2 not changed, each saying so and naming no
-/// commit.
+/// commit; every item gives a reason and all its lines agree.
 fn check_item_answers(
     text: &str,
     h1: &[String],
     f1: &[String],
     all: &[String],
 ) -> Result<(), String> {
-    for (item, real) in [("H1", h1), ("F1", f1)] {
-        if !item_answers(text, item)
-            .iter()
-            .any(|a| answers_changed(a, real))
-        {
-            return Err(format!(
-                "{item}: no line answers it as changed with a real commit touching its file ({real:?})"
-            ));
-        }
-    }
-    for item in ["H2", "F2"] {
-        if !item_answers(text, item)
-            .iter()
-            .any(|a| answers_not_changed(a, all))
-        {
-            return Err(format!("{item}: no line answers it as not changed"));
-        }
-    }
-    Ok(())
+    check_item(text, "H1", true, h1, all)?;
+    check_item(text, "F1", true, f1, all)?;
+    check_item(text, "H2", false, all, all)?;
+    check_item(text, "F2", false, all, all)
 }
 
 /// Whether a report affirms "this is a first review". A conditional ("if
@@ -1386,6 +1450,26 @@ fn the_coder_item_checks_accept_an_answer_only_for_its_own_item() {
                 "(H1) changed, commit 1111111:",
                 "(H1) not changed, commit 1111111:",
             ),
+        ),
+        (
+            "changed answers that are only a commit id, no reason",
+            "(H1) 1111111\n(H2) not changed: --help already printed the usage line; no commit.\n(F1) 2222222\n(F2) not done and no proof added, as you instructed.\n"
+                .to_string(),
+        ),
+        (
+            "a not-changed answer with no reason",
+            right.replace(
+                "(H2) not changed: --help already printed the usage line; no commit.",
+                "(H2) not changed",
+            ),
+        ),
+        (
+            "an accepted answer followed by a contradicting one",
+            format!("{right}(F2) changed: added soak proof today\n"),
+        ),
+        (
+            "a contradicting answer first, the accepted one after",
+            format!("(F2) changed, commit 2222222: added soak proof\n{right}"),
         ),
         (
             "quoted policy instead of item answers",

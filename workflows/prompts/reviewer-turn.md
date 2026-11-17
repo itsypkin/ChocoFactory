@@ -50,11 +50,14 @@ c) Your boundary and the chain. Every stage answer names the `anchor_id` this
 d) Which round it is, from what you found:
    - **First review** only if the chain is positively a fresh one: followed to
      its start, it holds only the initial path and nothing after a review. The
-     initial path is the `coding` results (more than one when a `blocked` one
-     was answered by `blocker` with `resumed`); for a spec-led task the planning
-     results before them, including a `needs_input` answered by
-     `spec_questions` with `resumed`. No result in it left `revising`, a review,
-     a check or a human gate that asked for changes. Then there is no earlier
+     initial path is the `coding` results and, when a `blocked` one was answered
+     by `blocker` with `resumed`, the `revising` results that answer led to (one
+     or several such cycles, all before any review); for a spec-led task the
+     planning results before them, including a `needs_input` answered by
+     `spec_questions` with `resumed`. A `revising` result is on it only when it
+     was reached from such a `blocker` answer; one reached from a review, a
+     check or a human gate that asked for changes is not. No result in it left a
+     review, a check or a human gate that asked for changes. Then there is no earlier
      report of yours and that is fine. The human's answers inside that path amend the
      requirements: apply them to the full review of the whole branch, and
      don't treat them as a narrowed round unless their own text narrows it
