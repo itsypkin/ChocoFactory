@@ -937,6 +937,13 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
             ),
         ),
         (
+            "support script finding for something other than its defect",
+            human.replace(
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+                "2. BLOCKING scripts/verify-backoff.sh: the usage text is unclear.",
+            ),
+        ),
+        (
             "README finding that revives the accepted soak run",
             human.replace(
                 "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.",
