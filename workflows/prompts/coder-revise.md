@@ -190,7 +190,9 @@ the code, make a real commit for it; an empty commit is not a way to finish
 a lap. Then call `report_outcome` with the outcome `done`, or `blocked` only as "When you can't go on" in your instructions allows. In its summary,
 give one short line per item you were sent back for: whether you changed it,
 why, and the short SHA of each commit that implements it, or that you didn't
-act on it, why, and that there is no commit. Cover every requested item and
+act on it, why, and that there is no commit. Get each SHA from
+`git log --oneline` after your last commit and write it out: "HEAD" is not a
+SHA. Cover every requested item and
 every in-scope blocking finding, so the next reviewer can match request →
 answer and commit → disposition from your report; put the same item-by-item
 mapping in your whole work report. On the `awaiting_human_review` path,

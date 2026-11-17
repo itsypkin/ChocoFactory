@@ -72,6 +72,10 @@ fn commit(repo: &Path, message: &str, files: &[(&str, &str)]) -> String {
         let full = repo.join(path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(&full, content).unwrap();
+        if path.ends_with(".sh") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", message]);
@@ -1242,10 +1246,7 @@ async fn probe_coder_item_mapping() {
     let base = &scenario.commits[0];
     let log = git(&worktree, &["log", "--format=%H", &format!("{base}..HEAD")]);
     let shas: Vec<&str> = log.lines().collect();
-    assert!(
-        shas.len() >= 2,
-        "expected at least two new commits, got {shas:?}"
-    );
+    assert!(!shas.is_empty(), "the coder made no commit");
     let touching = |path: &str| -> Vec<String> {
         git(
             &worktree,

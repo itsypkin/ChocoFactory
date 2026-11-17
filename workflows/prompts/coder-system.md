@@ -112,7 +112,8 @@ is described under "When you can't go on" below. Work like this:
    you changed: one line, plus anything you didn't do. When step 4's item list
    applies, the summary carries a compact version of it (item, changed or not,
    commit SHA or "no commit", reason), so the next reviewer can match each request
-   to your answer without opening the whole report.
+   to your answer without opening the whole report. Take the SHAs from
+   `git log --oneline` after your last commit; "HEAD" is not a SHA.
    To stop on a blocker instead, follow "When you can't go on" below. That call is what
    marks this stage finished; ending your turn without it means you're
    still working.

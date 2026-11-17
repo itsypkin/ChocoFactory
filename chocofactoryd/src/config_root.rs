@@ -3930,6 +3930,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             );
             says(
                 text,
+                &l("the summary's SHAs come from git"),
+                "Take the SHAs from `git log --oneline` after your last commit; \"HEAD\" is not a SHA.",
+            );
+            says(
+                text,
                 &l("report_outcome carries the mapping"),
                 "the summary carries a compact version of it (item, changed or not, commit SHA or \"no commit\", reason)",
             );
@@ -3939,6 +3944,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 text,
                 &format!("{label}: the revision summary maps every item to commits"),
                 "give one short line per item you were sent back for: whether you changed it, why, and the short SHA of each commit that implements it, or that you didn't act on it, why, and that there is no commit.",
+            );
+            says(
+                text,
+                &format!("{label}: SHAs come from git, not from HEAD"),
+                "Get each SHA from `git log --oneline` after your last commit and write it out: \"HEAD\" is not a SHA.",
             );
             says(
                 text,
