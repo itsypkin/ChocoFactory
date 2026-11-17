@@ -857,10 +857,15 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
         ),
         (
             "both defects folded into one finding",
-            right.replace(
-                "\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.",
-                "",
-            ),
+            right
+                .replace(
+                    "\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.",
+                    "",
+                )
+                .replace(
+                    "- `mkdir -p` still runs in dry-run.",
+                    "- `mkdir -p` still runs in dry-run, and the new `break` drops a later -v.",
+                ),
         ),
         (
             "old defect blocks under a second headline",
