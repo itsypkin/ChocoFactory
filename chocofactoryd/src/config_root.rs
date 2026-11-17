@@ -2278,6 +2278,42 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(!planned.contains("{{ task.input }}"));
     }
 
+    /// The planned workflow's header says what is true: only the writer turn
+    /// is its original with the planner's report substituted, and the coder and
+    /// reviewer turns retrieve the ready spec. A header that still promised
+    /// substitution for all four would send an editor back to inline delivery.
+    #[test]
+    fn the_planned_workflow_header_describes_retrieval_for_downstream_turns() {
+        let yaml = squash(
+            &BUILTIN_WORKFLOWS
+                .iter()
+                .find(|(name, _)| *name == "coding-task-planned")
+                .unwrap()
+                .1
+                .replace("\n# ", "\n"),
+        );
+        let header = yaml.split(" name: coding-task-planned").next().unwrap();
+        for (label, clause) in [
+            (
+                "the writer turn is the substituted one",
+                "The planned writer turn is its `coding-task` counterpart with `{{ task.input }}` replaced by the planner's report",
+            ),
+            (
+                "the coder and reviewer turns retrieve the ready spec",
+                "The planned coder and reviewer turns (three files) don't inline anything: they read the agreed spec with `get_context` (source `stage`, stage `spec_check`, outcome `ready`)",
+            ),
+        ] {
+            assert!(
+                header.contains(clause),
+                "{label}: the header lacks {clause:?}"
+            );
+        }
+        assert!(
+            !header.contains("each is its `coding-task` counterpart"),
+            "the header still says every twin is a substitution"
+        );
+    }
+
     #[test]
     fn planned_prompts_render_the_spec_not_the_task_text() {
         let payload = serde_json::json!({
