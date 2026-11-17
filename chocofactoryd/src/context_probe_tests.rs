@@ -844,6 +844,18 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
                 ),
         ),
         (
+            "regression not reported, an unrelated blocking finding says break",
+            right
+                .replace(
+                    "\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.",
+                    "",
+                )
+                .replace(
+                    "\n\nDismissed",
+                    "\nF4. BLOCKING README.md:3: this wording could break users.\n\nDismissed",
+                ),
+        ),
+        (
             "both defects folded into one finding",
             right.replace(
                 "\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.",
