@@ -3388,8 +3388,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     // These tests read the DELIVERED prompts: the system prompt followed by
     // the turn rendered from distinct sentinel captures, whitespace squashed.
     // They prove what the prompts say and that nothing superseded is still
-    // templated in. They do not prove what a model does with the text; the
-    // opt-in production-model probes cover that.
+    // templated in. They do not prove what a model does with the text.
 
     const SENTINEL_TASK_INPUT: &str = "SENTINEL-TASK-INPUT: rename the flag everywhere";
     const SENTINEL_SPEC: &str = "SENTINEL-SPEC-CHECK-SUMMARY: the hardened spec";
