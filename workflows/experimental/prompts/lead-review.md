@@ -36,8 +36,11 @@ report is the `summary` inside its capture; a human's capture is text.
    approve and don't call the round first or invent a waiver: report
    `changes_requested`, say exactly which lookup, result or link is unavailable
    and why, and don't loop on the lookup. A fresh first lap is only proven by a
-   chain that, followed to its start, holds just the initial path: the `coding`
-   results and, when a `blocked` one was answered by `blocker` with `resumed`,
+   chain that, followed to its start, holds just the initial path: the
+   `review_panel` result that launched you (source kind `parallel`, outcome
+   `done`, destination `lead_review`, no capture: automatic metadata, not a
+   review, a request or missing evidence; step past it to its predecessor), the
+   `coding` results and, when a `blocked` one was answered by `blocker` with `resumed`,
    the `revising` results that answer led to (all before any review), and the
    planning results before them, including a `needs_input` answered by
    `spec_questions` with `resumed`. A `revising` result reached from a review, a

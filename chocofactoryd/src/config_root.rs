@@ -4206,6 +4206,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         );
         says(
             &lead,
+            "lead: the group's own parallel result is automatic metadata on the initial path",
+            "the `review_panel` result that launched you (source kind `parallel`, outcome `done`, destination `lead_review`, no capture: automatic metadata, not a review, a request or missing evidence; step past it to its predecessor)",
+        );
+        says(
+            &lead,
             "lead: a revising reached from a review, check or gate is a correction",
             "A `revising` result reached from a review, a check or a human gate that asked for changes is not on it",
         );
@@ -4263,6 +4268,22 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             };
             assert_eq!(route("revising", "done"), review, "{wf}: revising done");
         }
+        // The lead is launched from the completed parallel group, so a first
+        // lead lap always has that group's result in its chain; its prompt
+        // must name it (see the lead delivery contract above).
+        let panel = defs.last().unwrap();
+        assert!(
+            matches!(
+                panel.stages["review_panel"].kind,
+                crate::workflow_def::StageKind::Parallel { .. }
+            ),
+            "the lead's anchor is a parallel result"
+        );
+        assert_eq!(
+            on_map(&panel.stages["review_panel"]),
+            [("done", "lead_review")],
+            "the group departs straight into the lead"
+        );
         // The planned ones also route a planning question through a gate.
         let planned = &defs[1];
         assert_eq!(

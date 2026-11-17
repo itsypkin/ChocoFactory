@@ -903,6 +903,16 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
         "Findings\n1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.\n3. nonblocking: the soak run was accepted by the human, not required.\n\nDismissed\n- jitter. Reviewed: {head}"
     );
     check_human_round("changes_requested", &human, head).unwrap();
+    // A blocking finding may still mention the accepted costs, as accepted.
+    check_human_round(
+        "changes_requested",
+        &human.replace(
+            "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+            "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.\n- the soak run is not required: the human accepted not making it.",
+        ),
+        head,
+    )
+    .unwrap();
     for (why, wrong) in [
         (
             "item 3 nonblocking",
@@ -948,6 +958,36 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
             human.replace(
                 "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.",
                 "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n- also the soak run is still required.",
+            ),
+        ),
+        (
+            // Naming the acceptance does not cancel the demand that follows.
+            "a blocking finding that names the acceptance and demands the run anyway",
+            human.replace(
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.\n- the human accepted not making the soak run, but run it before approval.",
+            ),
+        ),
+        (
+            "a blocking finding that accepts the jitter cost and still requires it",
+            human.replace(
+                "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.",
+                "1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n- jitter was declined by the human, yet it is required.",
+            ),
+        ),
+        (
+            // retry_delay is named, but not for being recomputed.
+            "a finding that merely names the function",
+            human.replace(
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+                "2. BLOCKING scripts/verify-backoff.sh: retry_delay has unclear documentation.",
+            ),
+        ),
+        (
+            "a finding that denies the recomputation",
+            human.replace(
+                "2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.",
+                "2. BLOCKING scripts/verify-backoff.sh: retry_delay is not recomputed here.",
             ),
         ),
         (
@@ -1219,7 +1259,7 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
         .collect();
     if !script
         .iter()
-        .any(|f| blocking(&f.headline) && has_any(&f.body, &["recompute", "retry_delay"]))
+        .any(|f| blocking(&f.headline) && names_recomputation(&f.body))
     {
         return Err("the defective support script does not block for its own defect".into());
     }
@@ -1230,8 +1270,63 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
         ));
     }
     // No blocking finding, whatever file it names, demands the accepted soak
-    // run or the jitter: a line that mentions one must also say it was
-    // accepted or declined.
+    // run or the jitter: a line that mentions one must say it was accepted or
+    // declined AND make no demand of its own ("accepted, but run it" revives
+    // the cost; the word "accepted" does not cancel the demand).
+    for f in all.iter().filter(|f| blocking(&f.headline)) {
+        for line in f.body.lines() {
+            if has_any(line, &["soak", "jitter"]) && !accepts_without_demanding(line) {
+                return Err(format!(
+                    "a revived requirement blocks ({}): {line}",
+                    f.headline
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a finding line says the support script recomputes the delays
+/// instead of calling the real `retry_delay`: both the function and the
+/// recomputation on one line, and not a denial of it.
+fn names_recomputation(body: &str) -> bool {
+    body.lines().any(|line| {
+        has_any(line, &["retry_delay", "lib/retry"])
+            && has_any(
+                line,
+                &[
+                    "recomput",
+                    "re-comput",
+                    "reimplement",
+                    "re-implement",
+                    "duplicat",
+                    "hard-code",
+                    "hardcode",
+                    "own copy",
+                    "instead of calling",
+                    "rather than calling",
+                    "without calling",
+                    "not calling",
+                    "does not call",
+                    "doesn't call",
+                    "never calls",
+                ],
+            )
+            && !has_any(
+                line,
+                &[
+                    "not recomput",
+                    "n't recomput",
+                    "no recomput",
+                    "never recomput",
+                ],
+            )
+    })
+}
+
+/// Whether a line about the accepted soak run or jitter accepts the cost and
+/// demands nothing: an acceptance marker, and no contrast or demand after it.
+fn accepts_without_demanding(line: &str) -> bool {
     const ACCEPTED: [&str; 8] = [
         "accept",
         "not required",
@@ -1242,17 +1337,31 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
         "no longer",
         "out of scope",
     ];
-    for f in all.iter().filter(|f| blocking(&f.headline)) {
-        for line in f.body.lines() {
-            if has_any(line, &["soak", "jitter"]) && !has_any(line, &ACCEPTED) {
-                return Err(format!(
-                    "a revived requirement blocks ({}): {line}",
-                    f.headline
-                ));
-            }
-        }
-    }
-    Ok(())
+    const DEMAND: [&str; 14] = [
+        "but ",
+        "however",
+        "nevertheless",
+        "although",
+        "still ",
+        "yet ",
+        "run it",
+        "must",
+        "should",
+        "needs to",
+        "need to",
+        "before approv",
+        "required",
+        "demand",
+    ];
+    let lower = line.to_lowercase();
+    // "not required", "no longer required" and "not demand" are the
+    // acceptance itself, not a demand.
+    let rest = lower
+        .replace("not required", "")
+        .replace("no longer required", "")
+        .replace("never required", "")
+        .replace("not demand", "");
+    has_any(line, &ACCEPTED) && !DEMAND.iter().any(|d| rest.contains(d))
 }
 
 /// Whether the human's hand-off was retrieved: by its stage, or by exactly its
@@ -1293,15 +1402,45 @@ const NOT_CHANGED: [&str; 7] = [
     "not implemented",
 ];
 
+/// How a changed answer opens: an explicit current disposition, not a bare
+/// commit pointer.
+const CHANGED_OPENERS: [&str; 9] = [
+    "changed",
+    "fixed",
+    "done",
+    "implemented",
+    "renamed",
+    "added",
+    "updated",
+    "resolved",
+    "made",
+];
+
+/// Words that say an item was changed. One in an answer that says "not
+/// changed" contradicts it unless it is itself negated ("no proof added").
+const CHANGED_WORDS: [&str; 8] = [
+    "changed",
+    "fixed",
+    "implemented",
+    "added",
+    "updated",
+    "renamed",
+    "committed",
+    "resolved",
+];
+
 fn names_a_commit(answer: &str, shas: &[String]) -> bool {
     shas.iter().any(|sha| answer.contains(&sha[..7]))
 }
 
 /// Words that give an answer's reason: what is left of it once the commit
-/// ids and the words of the disposition itself are taken out.
+/// ids and the words of the disposition itself, and pointers to some other
+/// place ("see above"), are taken out.
 fn reason_words(answer: &str) -> usize {
-    const FILLER: [&str; 9] = [
-        "changed", "change", "done", "fixed", "commit", "commits", "not", "and", "the",
+    const FILLER: [&str; 25] = [
+        "changed", "change", "done", "fixed", "commit", "commits", "not", "and", "the", "see",
+        "above", "below", "also", "this", "that", "same", "here", "there", "per", "item", "noted",
+        "already", "for", "with", "its",
     ];
     answer
         .split(|c: char| !c.is_alphanumeric())
@@ -1313,11 +1452,59 @@ fn reason_words(answer: &str) -> usize {
 
 const MIN_REASON_WORDS: usize = 2;
 
+/// The clauses of an answer: split at punctuation, so each carries one claim.
+fn clauses(answer: &str) -> Vec<Vec<&str>> {
+    answer
+        .split([';', ':', ',', '.', '(', ')'])
+        .map(|c| {
+            c.split(|ch: char| !(ch.is_alphanumeric() || ch == '\''))
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Whether some clause of a not-changed answer says the item WAS changed: a
+/// changed word with no negation among the (up to three) words before it in
+/// its clause, where "and", "but" and "then" end the look-back.
+fn claims_a_change(answer: &str) -> bool {
+    const NEGATIONS: [&str; 8] = [
+        "no", "not", "nothing", "never", "without", "didn't", "wasn't", "hasn't",
+    ];
+    clauses(answer).iter().any(|clause| {
+        clause.iter().enumerate().any(|(at, word)| {
+            if !CHANGED_WORDS.contains(word) {
+                return false;
+            }
+            for before in clause[..at].iter().rev().take(3) {
+                if NEGATIONS.contains(before) {
+                    return false;
+                }
+                if ["and", "but", "then", "yet"].contains(before) {
+                    break;
+                }
+            }
+            true
+        })
+    })
+}
+
+/// Whether some clause of a changed answer opens with a not-changed phrase.
+fn claims_no_change(answer: &str) -> bool {
+    answer
+        .split([';', ':', ',', '.', '(', ')'])
+        .map(str::trim)
+        .any(|c| NOT_CHANGED.iter().any(|p| c.starts_with(p)))
+}
+
 /// One item's answers in a text. EVERY line that answers it must agree: a
-/// changed item is answered only as changed, each answer naming a real commit
-/// touching its file and giving a reason; an unchanged item only as not
-/// changed, each answer opening with that, naming no commit and giving a
-/// reason. One acceptable line cannot cancel a contradicting one.
+/// changed item is answered only as changed (the answer opens with a changed
+/// disposition, none of its clauses says otherwise, it names a real commit
+/// touching its file and gives a reason); an unchanged item only as not
+/// changed (it opens with that, no clause of it claims a change, it names no
+/// commit and gives a reason). One acceptable line cannot cancel a
+/// contradicting one, and one line cannot contradict itself.
 fn check_item(
     text: &str,
     item: &str,
@@ -1332,14 +1519,18 @@ fn check_item(
     for a in &answers {
         let says_not_changed = NOT_CHANGED.iter().any(|p| a.starts_with(p));
         if changed {
-            if says_not_changed || !names_a_commit(a, real) {
+            if says_not_changed
+                || !CHANGED_OPENERS.iter().any(|p| a.starts_with(p))
+                || claims_no_change(a)
+                || !names_a_commit(a, real)
+            {
                 return Err(format!(
-                    "{item}: answered as changed, but this line is not a changed answer naming a real commit touching its file ({real:?}): {a}"
+                    "{item}: answered as changed, but this line is not a changed answer naming a real commit touching its file ({real:?}) without contradicting itself: {a}"
                 ));
             }
-        } else if !says_not_changed || names_a_commit(a, all) {
+        } else if !says_not_changed || names_a_commit(a, all) || claims_a_change(a) {
             return Err(format!(
-                "{item}: answered as not changed, but this line is not a not-changed answer without a commit: {a}"
+                "{item}: answered as not changed, but this line is not a not-changed answer without a commit or a claimed change: {a}"
             ));
         }
         if reason_words(a) < MIN_REASON_WORDS {
@@ -1477,6 +1668,42 @@ fn the_coder_item_checks_accept_an_answer_only_for_its_own_item() {
         (
             "a contradicting answer first, the accepted one after",
             format!("(F2) changed, commit 2222222: added soak proof\n{right}"),
+        ),
+        (
+            // "see above" must not pass for a reason, and a commit pointer is
+            // not a per-item answer.
+            "commit pointers that only say 'see above'",
+            right
+                .replace("(H1) changed, commit 1111111: exits 2 when SUBJECT is missing.", "(H1) commit 1111111 (see above).")
+                .replace("(F1) changed, commit 2222222: the subject is quoted.", "(F1) commit 2222222 (see above)."),
+        ),
+        (
+            "a changed answer that opens with a bare commit pointer and a reason",
+            right.replace(
+                "(H1) changed, commit 1111111:",
+                "(H1) commit 1111111:",
+            ),
+        ),
+        (
+            "a no-work answer that claims a change on the same line",
+            right.replace(
+                "(F2) not done and no proof added, as you instructed.",
+                "(F2) not done earlier; changed today: added the soak proof.",
+            ),
+        ),
+        (
+            "a no-work answer that claims a change in one clause",
+            right.replace(
+                "(F2) not done and no proof added, as you instructed.",
+                "(F2) not done earlier and changed today for good measure.",
+            ),
+        ),
+        (
+            "a changed answer that says on the same line it was not done",
+            right.replace(
+                "(F1) changed, commit 2222222: the subject is quoted.",
+                "(F1) changed, commit 2222222: the subject is quoted; not done for the second part.",
+            ),
         ),
         (
             "quoted policy instead of item answers",
