@@ -37,7 +37,7 @@ pub struct InitWorkflowsResult {
 
 /// Length of a stored task id (a hyphenated UUID), in bytes.
 const FULL_TASK_ID_LEN: usize = 36;
-/// Shortest task id prefix `choco` resolves; this is what listings print.
+/// Shortest task id prefix `choco` resolves.
 const MIN_TASK_ID_PREFIX_LEN: usize = 8;
 
 /// Mirrors this repo's hand-rolled `Display`-impl error convention

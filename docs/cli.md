@@ -191,11 +191,11 @@ Created   2026-08-01 12:33:37 UTC
 
 Every command that takes a task id — `status`, `events`, `send`, `cancel`,
 `retry`, `pause`, `resume` and `reconfigure` — accepts the full id or a unique
-prefix of at least 8 characters (the form listings print). The prefix is matched
+prefix of at least 8 characters (the first 8 characters of a full id). The prefix is matched
 literally and case-sensitively against every task's id, whatever its project or
 status. If it matches several tasks, `choco` fails listing every matching id and
 does nothing; a prefix that matches none, or one shorter than 8 characters, fails
-with `no such task`. Output always shows the full id. This is `choco` looking the
+with `no such task`. Task ids `choco` prints stay full ids. This is `choco` looking the
 id up in the task list; the daemon's HTTP API still takes full ids only.
 
 Check where it is. `Progress` shows the stages the task has passed

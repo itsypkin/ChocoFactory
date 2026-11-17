@@ -4085,7 +4085,7 @@ async fn task_prefix_status_and_events() {
         ));
         // Holds `abcdef01` mid-id, so it is no match for that prefix.
         s.tasks.push(FxTask::new(
-            "0000abcdef01-4222-8333-000000000010",
+            "00000000-4222-4333-8333-0000abcdef01",
             "p1",
             "open",
         ));
@@ -4613,7 +4613,12 @@ async fn task_prefix_watch_resolves_once() {
             .unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let mut first = String::new();
-        stdout.read_line(&mut first).await.unwrap();
+        // Each stdout read is bounded: a lookup or poll that never answers
+        // fails the test (the dropped child is killed) instead of hanging it.
+        tokio::time::timeout(LOAD_ALLOWANCE, stdout.read_line(&mut first))
+            .await
+            .expect("no first frame within LOAD_ALLOWANCE")
+            .unwrap();
         let first: Value = serde_json::from_str(&first).unwrap();
         assert_eq!(first["id"], ID_A);
         assert_eq!(first["status"], "open");
@@ -4638,7 +4643,10 @@ async fn task_prefix_watch_resolves_once() {
         .await;
         server.set(|s| s.released = true);
         let mut rest = String::new();
-        stdout.read_to_string(&mut rest).await.unwrap();
+        tokio::time::timeout(LOAD_ALLOWANCE, stdout.read_to_string(&mut rest))
+            .await
+            .expect("watcher stdout did not reach EOF within LOAD_ALLOWANCE")
+            .unwrap();
         let (code, stderr) = finish_watcher(child).await;
         assert_eq!(code, Some(0), "{extra:?}: {stderr}");
         let last: Value = serde_json::from_str(rest.lines().last().unwrap()).unwrap();

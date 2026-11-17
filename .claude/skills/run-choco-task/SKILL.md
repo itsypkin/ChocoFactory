@@ -282,11 +282,10 @@ choco task create --project <p> --workflow coding-task-planned \
   `id=$(choco --json task create … | jq -r .id)`.
 - Every `choco task` command that takes `<id>` (status, events, send, cancel,
   retry, pause, resume, reconfigure) accepts the full id or a unique
-  case-sensitive prefix of at least 8 characters, such as the 8 characters
-  `task list` prints. An ambiguous prefix fails listing every match and does
-  nothing; a prefix with no match, or under 8 characters, fails with
-  `no such task`. Use the full id in scripts and in anything that talks to the
-  daemon's HTTP API, which takes full ids only.
+  case-sensitive prefix of at least 8 characters, such as the first 8
+  characters of a full id. An ambiguous prefix fails listing every match and
+  does nothing; a prefix with no match, or under 8 characters, fails with
+  `no such task`. The daemon's HTTP API takes full ids only.
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
   `--role-cli <role>=<cli>`. A model may end in an effort level, for example
