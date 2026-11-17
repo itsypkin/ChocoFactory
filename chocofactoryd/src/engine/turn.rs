@@ -186,6 +186,17 @@ pub(super) struct PreparedTurn<'a> {
     context_template: Option<ContextBinding>,
 }
 
+/// Removes `stages[stage]` from a workflow payload, whatever JSON value it
+/// holds. A payload with no object `stages`, or no such entry, is left exactly
+/// as it was — it is not normalised into an object. `true` means something
+/// was removed.
+pub(super) fn remove_stage_capture(payload: &mut Value, stage: &str) -> bool {
+    payload
+        .get_mut("stages")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|stages| stages.remove(stage).is_some())
+}
+
 impl WorkflowEngine {
     /// Starts an agent turn, or — when its pool is full — queues it.
     ///
@@ -425,6 +436,59 @@ impl WorkflowEngine {
         })
     }
 
+    /// Removes `payload.stages[stage]` — the whole previous capture, outcome
+    /// and summary together — from the persisted workflow state.
+    ///
+    /// The state is read again here rather than taken from the payload the
+    /// turn was prepared from: parallel branches are prepared from one shared
+    /// payload, and writing that back would restore a capture an earlier
+    /// branch launch had just cleared. The caller holds the task's lock, so
+    /// the read and the write cannot interleave with another writer. Nothing
+    /// but `payload` changes (`enters_stage` is false), and nothing is
+    /// written when there is no entry to remove. No applied result is
+    /// recorded or moved: those live in the stage-result history, not here.
+    pub(super) async fn clear_stage_capture(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage: &str,
+    ) -> Result<(), EngineError> {
+        let state = workflow_state::get(&self.pool, task_id)
+            .await?
+            .ok_or(EngineError::NoWorkflowState)?;
+        let mut payload = state.payload;
+        if !remove_stage_capture(&mut payload, stage) {
+            return Ok(());
+        }
+        // `update` writes the kind with the rest of the row. A row from before
+        // the column existed has none, so it is taken from the definition
+        // rather than written back as an empty string.
+        let stage_kind = match state.stage_kind {
+            Some(kind) => kind,
+            None => definition
+                .stages
+                .get(&state.current_stage)
+                .ok_or_else(|| EngineError::UnknownStage(state.current_stage.clone()))?
+                .kind
+                .name()
+                .to_string(),
+        };
+        workflow_state::update(
+            &self.pool,
+            task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: state.current_stage,
+                stage_kind,
+                loop_counters: state.loop_counters,
+                payload,
+                enters_stage: false,
+            },
+        )
+        .await?
+        .ok_or(EngineError::NoWorkflowState)?;
+        Ok(())
+    }
+
     /// Creates the session and the process for a prepared turn that holds a
     /// slot (the second half of the old `enter_agent_turn`). `from_queue` is
     /// the queue row being replaced: its deletion and the session insert are
@@ -470,6 +534,17 @@ impl WorkflowEngine {
         } else {
             None
         };
+
+        // #353: the prompt above was rendered against the stage's previous
+        // capture, which is the only reason it may still be read. From here
+        // the turn is committed to start, so that capture stops being this
+        // stage's current verdict: a status read must not attribute it to an
+        // attempt that is running, interrupted or stuck. A failure returns
+        // here, before any session exists.
+        if session_kind == SessionKind::SingleShot {
+            self.clear_stage_capture(task_id, definition, stage_name)
+                .await?;
+        }
 
         let new_session = sessions::NewSession {
             task_id,

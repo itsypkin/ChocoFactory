@@ -17,6 +17,7 @@ mod parked_gates;
 mod pause;
 mod queue;
 mod stage_results;
+mod stale_capture;
 
 #[test]
 fn set_arrival_replaces_a_non_object_payload() {
