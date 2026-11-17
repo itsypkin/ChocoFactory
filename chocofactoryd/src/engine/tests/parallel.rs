@@ -2872,3 +2872,52 @@ async fn the_poll_sweep_ignores_a_group() {
     );
     assert_eq!(snapshot(&g).await, before);
 }
+
+// #353: every restarted branch drops its own previous capture. The two
+// branches are prepared from one payload, so a clear that wrote that payload
+// back would restore the first branch's capture when the second launches.
+#[tokio::test]
+async fn parallel_launch_clears_each_restarted_capture_without_restoring_another() {
+    let g = both_running().await;
+    idle_pair(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let state = g.state().await;
+    let mut payload = state.payload.clone();
+    payload["stages"] = json!({
+        "one": {"outcome": "blocking", "summary": "OLD-ONE-CAPTURE"},
+        "two": {"outcome": "blocking", "summary": "OLD-TWO-CAPTURE"},
+        "elsewhere": {"outcome": "done", "summary": "OTHER-STAGE-KEPT"},
+    });
+    workflow_state::update(
+        &g.pool,
+        &g.task_id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage,
+            stage_kind: state.stage_kind.unwrap(),
+            loop_counters: state.loop_counters,
+            payload: payload.clone(),
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    set_script(
+        &g,
+        by_prompt(&[
+            ("BRANCH-ONE", hold_steps()),
+            ("BRANCH-TWO", hold_steps()),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    retry(&g, RetryMode::Fresh).await.unwrap();
+    g.wait_sessions("one", 2).await;
+    g.wait_sessions("two", 2).await;
+
+    let after = g.state().await.payload;
+    assert_eq!(
+        after["stages"],
+        json!({"elsewhere": {"outcome": "done", "summary": "OTHER-STAGE-KEPT"}}),
+        "a restarted branch's old capture is still live, or another stage's was removed"
+    );
+}
