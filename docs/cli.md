@@ -189,12 +189,21 @@ Repo      /Users/you/code/acme
 Created   2026-08-01 12:33:37 UTC
 ```
 
+Every command that takes a task id — `status`, `events`, `send`, `cancel`,
+`retry`, `pause`, `resume` and `reconfigure` — accepts the full id or a unique
+prefix of at least 8 characters (the form listings print). The prefix is matched
+literally and case-sensitively against every task's id, whatever its project or
+status. If it matches several tasks, `choco` fails listing every matching id and
+does nothing; a prefix that matches none, or one shorter than 8 characters, fails
+with `no such task`. Output always shows the full id. This is `choco` looking the
+id up in the task list; the daemon's HTTP API still takes full ids only.
+
 Check where it is. `Progress` shows the stages the task has passed
 through, the outcome that caused each hop, and when it happened —
 starting with the stage it began in:
 
 ```
-$ choco task status bb93ada3-...
+$ choco task status bb93ada3
 Title     ship the thing
 ...
 Closes    #152, #126
@@ -305,9 +314,9 @@ The daemon accepts it asynchronously, so the effect shows up in the task's
 events, not in this response:
 
 ```
-$ choco task send bb93ada3-... --text $'Looks good.\n/approve'
-Message accepted for task bb93ada3-.... The reply is recorded as an event
-— see `choco task events bb93ada3-...`.
+$ choco task send bb93ada3 --text $'Looks good.\n/approve'
+Message accepted for task bb93ada3-2910-4b94-911d-f6e8aab426dd. The reply is recorded as an event
+— see `choco task events bb93ada3-2910-4b94-911d-f6e8aab426dd`.
 ```
 
 Stop a task that has gone wrong. This kills its agent process — and
@@ -318,9 +327,9 @@ task's timeline before the branch is deleted, so `choco task events` still
 tells you where it was:
 
 ```
-$ choco task cancel bb93ada3-...
-Task bb93ada3-... cancelled. Any running agent process, worktree and local
-branch have been cleaned up — see `choco task status bb93ada3-...`.
+$ choco task cancel bb93ada3
+Task bb93ada3-2910-4b94-911d-f6e8aab426dd cancelled. Any running agent process, worktree and local
+branch have been cleaned up — see `choco task status bb93ada3-2910-4b94-911d-f6e8aab426dd`.
 ```
 
 To take the work over yourself, cancel with `--keep`. It stops the agents
@@ -362,9 +371,9 @@ $ choco task list --status stuck
 Read the reason. This example is a workflow with a shell stage named `run`:
 
 ```
-$ choco task status bb93ada3-...
+$ choco task status bb93ada3
 Title   t
-ID      bb93ada3-...
+ID      bb93ada3-2910-4b94-911d-f6e8aab426dd
 ...
 Status  stuck
 Stuck   stage 'run': command finished with outcome 'error' but the stage
@@ -377,9 +386,9 @@ replay of whatever happened before, since the daemon never persisted an
 outcome to replay:
 
 ```
-$ choco task retry bb93ada3-...
+$ choco task retry bb93ada3
 Retrying stage 'run' from scratch, in a fresh session: it is not an agent
-turn, so it has no session. See `choco task status bb93ada3-...`.
+turn, so it has no session. See `choco task status bb93ada3-2910-4b94-911d-f6e8aab426dd`.
 ```
 
 A `shell` stage has no agent session, so there is nothing to resume and it
@@ -389,10 +398,10 @@ resumed instead, continuing the same CLI session rather than starting a new
 one over a working tree full of work it knows nothing about:
 
 ```
-$ choco task retry bb93ada3-...
+$ choco task retry bb93ada3
 Retrying stage 'coding' by resuming its interrupted session
 (47a18986-...) — it picks up where it left off, with its working tree
-untouched. See `choco task status bb93ada3-...`.
+untouched. See `choco task status bb93ada3-2910-4b94-911d-f6e8aab426dd`.
 ```
 
 Anything the agent itself got wrong still starts fresh — `Retrying stage
@@ -411,9 +420,9 @@ with its schedule starting over, and no agent lap is spent. `--resume` and
 `--fresh` don't apply and are refused:
 
 ```
-$ choco task retry bb93ada3-...
+$ choco task retry bb93ada3
 Watching again: back to stage 'awaiting_human_review' (its schedule starts
-over). See `choco task status bb93ada3-...`.
+over). See `choco task status bb93ada3-2910-4b94-911d-f6e8aab426dd`.
 ```
 
 `choco task status` says when this applies. Any other open task can't be
@@ -422,7 +431,7 @@ retried.
 Or give up on it the same way as any other task:
 
 ```
-$ choco task cancel bb93ada3-...
+$ choco task cancel bb93ada3
 ```
 
 A stuck task accepts no messages (`choco task send` is a `409`, the same
@@ -431,7 +440,7 @@ shape as sending to a cancelled task) until a retry reopens it.
 Read the conversation (this sample is from a `chat` task):
 
 ```
-$ choco task events bb93ada3-...
+$ choco task events bb93ada3
 TIME                     KIND               DETAIL
 2026-08-01 12:33:51 UTC  human_message      explain the plan
 2026-08-01 12:33:51 UTC  session_meta       a4cbce43-e70c-49ab-a407-2ae4701b7838
@@ -485,11 +494,11 @@ To free the machine for a while, or to stop one task while another finishes,
 pause it instead of cancelling it:
 
 ```
-$ choco task pause bb93ada3-...
-Task bb93ada3-... is pausing: waiting for 'coding' to finish (1 running). It is
-paused once that ends; `choco task pause bb93ada3-... --now` stops it sooner.
-$ choco task status bb93ada3-... --until paused
-$ choco task resume bb93ada3-...
+$ choco task pause bb93ada3
+Task bb93ada3-2910-4b94-911d-f6e8aab426dd is pausing: waiting for 'coding' to finish (1 running). It is
+paused once that ends; `choco task pause bb93ada3-2910-4b94-911d-f6e8aab426dd --now` stops it sooner.
+$ choco task status bb93ada3 --until paused
+$ choco task resume bb93ada3
 ```
 
 A paused task has its own status, and so does the stretch before it:
@@ -565,7 +574,7 @@ for it; they all start when the turn starts. After a daemon restart queued
 turns are still queued, in their original order.
 
 ```
-$ choco task status 7d22e1a8-…
+$ choco task status 7d22e1a8
 …
 Stage   internal_review
 Queued  internal_review, 2nd in line for the server's 2 agent slots (both busy), since 14:02 UTC

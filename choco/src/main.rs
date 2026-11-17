@@ -117,7 +117,7 @@ fn resolve_base_url_in(
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Handled before `Client::new` and outside the `Output`/`run` path
     // entirely: serving the MCP tools must never depend on `chocofactoryd`
@@ -203,6 +203,22 @@ async fn main() -> ExitCode {
         }
     };
     let client = Client::new(base_url);
+
+    // One resolution point for every id-bearing task command, before the
+    // watching `status` special case below: a short id becomes the stored
+    // full id here, once, and everything after (dispatch, watch polls,
+    // follow-up reads) uses that.
+    if let Command::Task(task) = &mut cli.command
+        && let Some(id) = task.id_mut()
+    {
+        match client.resolve_task_id(id).await {
+            Ok(full) => *id = full,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // A watching `task status` returns its own exit code (3–6 for the ways a
     // watch can end other than success), so it's handled apart from `run`.
