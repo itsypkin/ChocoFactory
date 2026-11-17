@@ -224,7 +224,7 @@ pub(crate) fn mixed_rereview(repo: &Path) -> Scenario {
         ],
     );
     // A: the coder's first attempt. Dry-run is parsed, but DEST is still created.
-    let sync_a = "#!/usr/bin/env bash\n# Usage: sync.sh SRC DEST [-v] [--dry-run]\nset -euo pipefail\n. \"$(dirname \"$0\")/../lib/copy.sh\"\nsrc=$1; dest=$2; verbose=0; dry=0\nfor arg in \"${@:3}\"; do\n  case $arg in\n    --dry-run) dry=1 ;;\n    -v) verbose=1 ;;\n  esac\ndone\nmkdir -p \"$dest\"\nfor f in \"$src\"/*; do\n  if [ \"$dry\" = 1 ]; then echo \"would copy $(basename \"$f\")\"; continue; fi\n  copy_file \"$f\" \"$dest\" \"$verbose\"\ndone\n";
+    let sync_a = "#!/usr/bin/env bash\n# Usage: sync.sh SRC DEST [-v] [--dry-run]\nset -euo pipefail\n. \"$(dirname \"$0\")/../lib/copy.sh\"\nsrc=$1; dest=$2; verbose=0; dry=0\nfor arg in \"${@:3}\"; do\n  case $arg in\n    --dry-run) dry=1 ;;\n    -v) verbose=1 ;;\n  esac\ndone\nmkdir -p \"$dest\"\nfor f in \"$src\"/*; do\n  if [ \"$dry\" = 1 ]; then echo \"would copy $(basename \"$f\")\"; [ \"$verbose\" = 1 ] && echo \"  from $f\"; continue; fi\n  copy_file \"$f\" \"$dest\" \"$verbose\"\ndone\n";
     let test_a = "#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")/..\"\nt=$(mktemp -d); mkdir \"$t/src\"; echo hi > \"$t/src/a.txt\"\nout=$(bin/sync.sh \"$t/src\" \"$t/dest\" --dry-run)\n[ \"$out\" = \"would copy a.txt\" ] || { echo FAIL output; exit 1; }\n[ ! -e \"$t/dest/a.txt\" ] || { echo FAIL wrote; exit 1; }\necho ok\n";
     let a = commit(
         repo,
@@ -237,11 +237,12 @@ pub(crate) fn mixed_rereview(repo: &Path) -> Scenario {
         "Document --dry-run in the README",
         &[(
             "README.md",
-            "# filesync\n\nCopies every file of SRC into DEST.\n\n    bin/sync.sh SRC DEST [-v] [--dry-run]\n\n`--dry-run` prints `would copy NAME` for each file and writes nothing.\n",
+            "# filesync\n\nCopies every file of SRC into DEST.\n\n    bin/sync.sh SRC DEST [-v] [--dry-run]\n\n`--dry-run` prints `would copy NAME` for each file and writes nothing; with `-v` it also prints `  from PATH` under each line.\n",
         )],
     );
-    // C2 refactors the parsing: `break` after --dry-run drops a later -v.
-    let sync_c2 = "#!/usr/bin/env bash\n# Usage: sync.sh SRC DEST [-v] [--dry-run]\nset -euo pipefail\n. \"$(dirname \"$0\")/../lib/copy.sh\"\nsrc=$1; dest=$2; verbose=0; dry=0\nfor arg in \"${@:3}\"; do\n  case $arg in\n    --dry-run) dry=1; break ;;\n    -v) verbose=1 ;;\n    *) echo \"unknown flag $arg\" >&2; exit 2 ;;\n  esac\ndone\nmkdir -p \"$dest\"\nfor f in \"$src\"/*; do\n  if [ \"$dry\" = 1 ]; then echo \"would copy $(basename \"$f\")\"; continue; fi\n  copy_file \"$f\" \"$dest\" \"$verbose\"\ndone\n";
+    // C2 refactors the parsing: `break` after --dry-run drops a later -v, so
+    // `sync.sh SRC DEST --dry-run -v` no longer prints the `  from PATH` lines.
+    let sync_c2 = "#!/usr/bin/env bash\n# Usage: sync.sh SRC DEST [-v] [--dry-run]\nset -euo pipefail\n. \"$(dirname \"$0\")/../lib/copy.sh\"\nsrc=$1; dest=$2; verbose=0; dry=0\nfor arg in \"${@:3}\"; do\n  case $arg in\n    --dry-run) dry=1; break ;;\n    -v) verbose=1 ;;\n    *) echo \"unknown flag $arg\" >&2; exit 2 ;;\n  esac\ndone\nmkdir -p \"$dest\"\nfor f in \"$src\"/*; do\n  if [ \"$dry\" = 1 ]; then echo \"would copy $(basename \"$f\")\"; [ \"$verbose\" = 1 ] && echo \"  from $f\"; continue; fi\n  copy_file \"$f\" \"$dest\" \"$verbose\"\ndone\n";
     let c2 = commit(
         repo,
         "Tidy the argument parsing and reject unknown flags",
@@ -251,7 +252,7 @@ pub(crate) fn mixed_rereview(repo: &Path) -> Scenario {
     let input = format!(
         "Add a `--dry-run` flag to bin/sync.sh.\n\nWith it the script prints `would copy NAME` for each file of SRC and changes nothing on \
 disk: no directory is created and no file is written. `-v` must keep working, in either order \
-with `--dry-run`. The tool must never delete a file in DEST that SRC does not replace: that \
+with `--dry-run`: in a dry run `-v` also prints `  from PATH` under each line. The tool must never delete a file in DEST that SRC does not replace: that \
 promise is the reason people trust it with their backups. Add tests/test_dry_run.sh and mention \
 the flag in README.md. {}",
         long(2)
@@ -291,6 +292,9 @@ the flag in README.md. {}",
 // ---- 2: a human-started round carried through another internal correction --
 
 const PLANNER_SPEC: &str = "Checks: the repository has lib/retry.sh with an unbounded backoff; README.md documents RETRY_MAX.\n\nDecisions: cap the delay at 30 seconds; keep jitter configurable through RETRY_JITTER; a 12-hour soak run of the retry loop must be completed and reported before approval.\n\nQuestions: none.\n\nSpec:\n1. lib/retry.sh must cap the backoff delay at 30 seconds.\n2. Jitter stays configurable through RETRY_JITTER.\n3. A 12-hour soak run of the retry loop is required as proof before the change is approved.\n4. Out of scope: the HTTP client itself.";
+
+/// Where the human's hand-off sits in `human_scoped_round`'s history.
+pub(crate) const HUMAN_HANDOFF: usize = 8;
 
 pub(crate) fn human_scoped_round(repo: &Path) -> Scenario {
     init_repo(repo);
@@ -720,7 +724,7 @@ async fn the_probe_fixtures_are_served_by_the_real_lookup() {
             json!({"source": "stage", "stage": "awaiting_human_review"}),
             json!({"source": "stage", "stage": "revising"}),
             json!({"source": "stage", "stage": "internal_review"}),
-            json!({"source": "stage", "result_id": ids[9]}),
+            json!({"source": "stage", "result_id": ids[HUMAN_HANDOFF + 1]}),
         ],
     )
     .await;
@@ -730,6 +734,7 @@ async fn the_probe_fixtures_are_served_by_the_real_lookup() {
     );
     let human = got[1].json();
     assert_eq!(human["result"]["source_kind"], "human_gate");
+    assert_eq!(human["result"]["result_id"], json!(ids[HUMAN_HANDOFF]));
     assert!(
         human["result"]["capture"]
             .as_str()
@@ -738,7 +743,10 @@ async fn the_probe_fixtures_are_served_by_the_real_lookup() {
     );
     assert_eq!(got[2].json()["result"]["result_id"], json!(ids[16]));
     assert_eq!(got[3].json()["result"]["result_id"], json!(ids[12]));
-    assert_eq!(got[4].json()["result"]["previous_result_id"], json!(ids[8]));
+    assert_eq!(
+        got[4].json()["result"]["previous_result_id"],
+        json!(ids[HUMAN_HANDOFF])
+    );
 
     // 3: the pruned hand-off is a named gap, not an empty answer.
     let three = missing_history(&root.join("three"));
@@ -821,6 +829,34 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
             ),
         ),
         ("HEAD not named", right.replace(head, "5afd54d")),
+        (
+            // A blocking finding elsewhere that happens to say "break" must
+            // not stand in for the regression the report made nonblocking.
+            "regression nonblocking, an unrelated blocking finding says break",
+            right
+                .replace(
+                    "F3. BLOCKING, new code",
+                    "F3. nonblocking advisory, new code",
+                )
+                .replace(
+                    "\n\nDismissed",
+                    "\nF4. BLOCKING README.md:3: this wording could break users.\n\nDismissed",
+                ),
+        ),
+        (
+            "both defects folded into one finding",
+            right.replace(
+                "\nF3. BLOCKING, new code. bin/sync.sh:8.\n- the `break` drops a later -v.",
+                "",
+            ),
+        ),
+        (
+            "old defect blocks under a second headline",
+            right.replace(
+                "\n\nDismissed",
+                "\nA3. BLOCKING lib/copy.sh:5: the .bak delete.\n\nDismissed",
+            ),
+        ),
     ] {
         assert!(
             check_mixed_rereview("changes_requested", &wrong, head).is_err(),
@@ -833,6 +869,10 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
         "OK. This is a first review of the branch."
     ));
     assert!(invents_first_review("Treating this as a first review."));
+    assert!(invents_first_review("This is my first review of the task."));
+    assert!(invents_first_review(
+        "It's a first review, so everything is in scope."
+    ));
     for fine in [
         "If this is a first review or inside the human's scope, it would block.",
         "I neither treat this as a first review nor approve.",
@@ -858,6 +898,21 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
         (
             "soak revived",
             human.replace("3. nonblocking: the soak", "3. BLOCKING: the soak"),
+        ),
+        (
+            // The word "soak" is in the body, not the headline.
+            "soak revived in the body of a blocking finding",
+            human.replace(
+                "3. nonblocking: the soak run was accepted by the human, not required.",
+                "3. BLOCKING scripts/run-all.sh: no proof of the retry loop.\n- the 12-hour soak run was never made.",
+            ),
+        ),
+        (
+            "item 3 also reported as not blocking",
+            human.replace(
+                "\n\nDismissed",
+                "\n4. nonblocking README.md: RETRY_MAX still appears.\n\nDismissed",
+            ),
         ),
     ] {
         assert!(
@@ -1015,9 +1070,19 @@ fn has_any(text: &str, words: &[&str]) -> bool {
     words.iter().any(|w| lower.contains(w))
 }
 
-/// Probe 1's verdict on a report: the unresolved earlier blocker and the
-/// correction-introduced regression block; the old defect in the unchanged
-/// callee is prominent, serious and nonblocking.
+/// The indexes of the findings whose HEADLINE names `file` and whose text
+/// mentions one of `tokens`. A finding counts for a subject only when it is
+/// about that subject's file; a word in some other finding proves nothing.
+fn findings_about(all: &[Finding], file: &str, tokens: &[&str]) -> Vec<usize> {
+    (0..all.len())
+        .filter(|&i| all[i].headline.contains(file) && has_any(&all[i].body, tokens))
+        .collect()
+}
+
+/// Probe 1's verdict on a report: the unresolved earlier blocker (DEST is
+/// still created) and the correction-introduced regression (`--dry-run -v`
+/// lost its `-v` output) are separate blocking findings; the old defect in the
+/// unchanged callee is prominent, serious and nonblocking.
 fn check_mixed_rereview(outcome: &str, summary: &str, head: &str) -> Result<(), String> {
     if outcome != "changes_requested" {
         return Err(format!("outcome {outcome}"));
@@ -1026,29 +1091,44 @@ fn check_mixed_rereview(outcome: &str, summary: &str, head: &str) -> Result<(), 
         return Err(format!("the summary doesn't name the full HEAD SHA {head}"));
     }
     let all = findings(summary);
-    let about = |token: &'static str| all.iter().filter(move |f| f.body.contains(token));
-    if !about("mkdir").any(|f| blocking(&f.headline)) {
-        return Err("the unresolved earlier blocker (DEST still created) does not block".into());
+    let earlier = findings_about(&all, "sync.sh", &["mkdir"]);
+    if earlier.is_empty() {
+        return Err("the unresolved earlier blocker (DEST still created) is not reported".into());
     }
-    if let Some(f) = about("mkdir").find(|f| nonblocking(&f.headline)) {
+    if let Some(&i) = earlier.iter().find(|&&i| !blocking(&all[i].headline)) {
         return Err(format!(
-            "the earlier blocker was made nonblocking: {}",
-            f.headline
+            "the earlier blocker does not block: {}",
+            all[i].headline
         ));
     }
-    if !about("break").any(|f| blocking(&f.headline)) {
-        return Err("the correction-introduced regression does not block".into());
-    }
-    let old: Vec<&Finding> = all
-        .iter()
-        .filter(|f| f.headline.contains("copy.sh") && f.headline.contains(".bak"))
+    let regression: Vec<usize> = findings_about(&all, "sync.sh", &["-v", "verbose", "break"])
+        .into_iter()
+        .filter(|i| !earlier.contains(i))
         .collect();
-    let Some(old) = old.first() else {
+    if regression.is_empty() {
+        return Err(
+            "the correction-introduced regression is not reported as a finding of its own".into(),
+        );
+    }
+    if let Some(&i) = regression.iter().find(|&&i| !blocking(&all[i].headline)) {
+        return Err(format!(
+            "the correction-introduced regression does not block: {}",
+            all[i].headline
+        ));
+    }
+    let about_copy: Vec<&Finding> = all
+        .iter()
+        .filter(|f| f.headline.contains("copy.sh"))
+        .collect();
+    let Some(old) = about_copy.iter().find(|f| f.headline.contains(".bak")) else {
         return Err("the old defect in lib/copy.sh is not reported as a finding".into());
     };
-    if blocking(&old.headline) || !nonblocking(&old.headline) {
+    if let Some(f) = about_copy.iter().find(|f| blocking(&f.headline)) {
+        return Err(format!("the old defect blocks: {}", f.headline));
+    }
+    if !nonblocking(&old.headline) {
         return Err(format!(
-            "the old defect is not nonblocking: {}",
+            "the old defect is not marked nonblocking: {}",
             old.headline
         ));
     }
@@ -1062,7 +1142,8 @@ fn check_mixed_rereview(outcome: &str, summary: &str, head: &str) -> Result<(), 
 }
 
 /// Probe 2's verdict: the false item-3 claim and the defective support
-/// script block; the accepted soak run and the jitter demand do not.
+/// script block; the accepted soak run and the jitter demand do not, wherever
+/// in a blocking finding they are mentioned.
 fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), String> {
     if outcome != "changes_requested" {
         return Err(format!("outcome {outcome}"));
@@ -1071,19 +1152,126 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
         return Err(format!("the summary doesn't name the full HEAD SHA {head}"));
     }
     let all = findings(summary);
-    let about = |token: &'static str| all.iter().filter(move |f| f.body.contains(token));
-    if !about("HTTP_RETRY_MAX").any(|f| blocking(&f.headline)) {
+    let rename: Vec<&Finding> = all
+        .iter()
+        .filter(|f| {
+            has_any(&f.headline, &["readme", "retry_max", "item 3"]) && f.body.contains("RETRY_MAX")
+        })
+        .collect();
+    if !rename.iter().any(|f| blocking(&f.headline)) {
         return Err("item 3 (claimed resolved, not done) does not block".into());
     }
-    if !about("verify-backoff").any(|f| blocking(&f.headline)) {
+    if let Some(f) = rename.iter().find(|f| !blocking(&f.headline)) {
+        return Err(format!(
+            "item 3 is also reported as not blocking: {}",
+            f.headline
+        ));
+    }
+    let script: Vec<&Finding> = all
+        .iter()
+        .filter(|f| f.headline.contains("verify-backoff"))
+        .collect();
+    if !script.iter().any(|f| blocking(&f.headline)) {
         return Err("the defective support script does not block".into());
     }
-    for token in ["soak", "jitter", "Jitter", "JITTER"] {
-        if let Some(f) = all
-            .iter()
-            .find(|f| f.headline.contains(token) && blocking(&f.headline))
-        {
+    if let Some(f) = script.iter().find(|f| !blocking(&f.headline)) {
+        return Err(format!(
+            "the support script is also reported as not blocking: {}",
+            f.headline
+        ));
+    }
+    for f in all.iter().filter(|f| blocking(&f.headline)) {
+        let about_work = has_any(&f.headline, &["verify-backoff"])
+            || has_any(&f.headline, &["readme", "retry_max", "item 3"])
+                && f.body.contains("RETRY_MAX");
+        if !about_work && has_any(&f.body, &["soak", "jitter"]) {
             return Err(format!("a revived requirement blocks: {}", f.headline));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the human's hand-off was retrieved: by its stage, or by exactly its
+/// own result ID. Any other `result_id` is some other result.
+fn handoff_retrieved(contexts: &[Value], handoff_id: &str) -> bool {
+    contexts
+        .iter()
+        .any(|c| c["stage"] == "awaiting_human_review" || c["result_id"] == handoff_id)
+}
+
+/// The answer on each line that opens with an item's label (`(H1)`, `F2:`,
+/// `- **H1**`), lowercased and with the label and its punctuation removed.
+fn item_answers(text: &str, item: &str) -> Vec<String> {
+    let item = item.to_lowercase();
+    text.lines()
+        .filter_map(|line| {
+            let line = line.to_lowercase();
+            let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+            let rest = line.strip_prefix(item.as_str())?;
+            if rest.chars().next().is_some_and(char::is_alphanumeric) {
+                return None;
+            }
+            Some(
+                rest.trim_start_matches(|c: char| !c.is_alphanumeric())
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+const NOT_CHANGED: [&str; 7] = [
+    "not done",
+    "not changed",
+    "no change",
+    "unchanged",
+    "no commit",
+    "declined",
+    "not implemented",
+];
+
+fn names_a_commit(answer: &str, shas: &[String]) -> bool {
+    shas.iter().any(|sha| answer.contains(&sha[..7]))
+}
+
+/// An answer that opens by saying the item was not changed, and claims no
+/// commit: the literal words "no commit" are one way to say it, not the only
+/// one, but "changed: added it today; it was not done yesterday" is not one.
+fn answers_not_changed(answer: &str, shas: &[String]) -> bool {
+    NOT_CHANGED.iter().any(|p| answer.starts_with(p)) && !names_a_commit(answer, shas)
+}
+
+/// An answer that does not open with "not changed" and names a real commit.
+fn answers_changed(answer: &str, commits_for_the_item: &[String]) -> bool {
+    !NOT_CHANGED.iter().any(|p| answer.starts_with(p))
+        && names_a_commit(answer, commits_for_the_item)
+}
+
+/// The coder's item mapping, in one text (the work report, or the
+/// report_outcome summary): H1 and F1 changed, each naming a real commit that
+/// touches its own file; H2 and F2 not changed, each saying so and naming no
+/// commit.
+fn check_item_answers(
+    text: &str,
+    h1: &[String],
+    f1: &[String],
+    all: &[String],
+) -> Result<(), String> {
+    for (item, real) in [("H1", h1), ("F1", f1)] {
+        if !item_answers(text, item)
+            .iter()
+            .any(|a| answers_changed(a, real))
+        {
+            return Err(format!(
+                "{item}: no line answers it as changed with a real commit touching its file ({real:?})"
+            ));
+        }
+    }
+    for item in ["H2", "F2"] {
+        if !item_answers(text, item)
+            .iter()
+            .any(|a| answers_not_changed(a, all))
+        {
+            return Err(format!("{item}: no line answers it as not changed"));
         }
     }
     Ok(())
@@ -1092,26 +1280,6 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
 /// Whether a report affirms "this is a first review". A conditional ("if
 /// this is a first review") or a refusal ("I do not treat this as a first
 /// review") is not an affirmation.
-/// An item line that explicitly says the item was not changed: the literal
-/// words "no commit" are one way to say it, not the only one.
-fn answers_not_changed(line: &str) -> bool {
-    let line = line.to_lowercase();
-    ["no commit", "not changed", "no change", "not done"]
-        .iter()
-        .any(|phrase| line.contains(phrase))
-}
-
-#[test]
-fn a_not_changed_item_may_say_so_without_the_words_no_commit() {
-    // The recorded third coder run's answer for the declined proof item.
-    assert!(answers_not_changed(
-        "(f2) not done and no proof added, as you instructed"
-    ));
-    assert!(answers_not_changed("(h2) not changed: no commit, as asked"));
-    // A line that only mentions the item, with no answer, is not accepted.
-    assert!(!answers_not_changed("(f2) the soak proof, see the spec"));
-}
-
 fn invents_first_review(summary: &str) -> bool {
     let lower = summary.to_lowercase();
     lower.match_indices("first review").any(|(at, _)| {
@@ -1120,9 +1288,20 @@ fn invents_first_review(summary: &str) -> bool {
             from -= 1;
         }
         let before = &lower[from..at];
-        let affirms = ["this is a ", "this as a ", "this was a ", "this is the "]
-            .iter()
-            .any(|p| before.ends_with(p));
+        let affirms = [
+            "this is a ",
+            "this as a ",
+            "this was a ",
+            "this is the ",
+            "this is my ",
+            "this is our ",
+            "it is a ",
+            "it's a ",
+            "treating this as ",
+            "treat this as ",
+        ]
+        .iter()
+        .any(|p| before.ends_with(p));
         let hedged = [
             "if ", "whether", "not ", "n't", "neither", "nor ", "never", "unless",
         ]
@@ -1130,6 +1309,241 @@ fn invents_first_review(summary: &str) -> bool {
         .any(|w| before.contains(w));
         affirms && !hedged
     })
+}
+
+/// The coder probe's checks, on hand-written reports. Free: no model.
+#[test]
+fn the_coder_item_checks_accept_an_answer_only_for_its_own_item() {
+    let h1 = vec!["1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()];
+    let f1 = vec!["2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()];
+    let all: Vec<String> = h1.iter().chain(&f1).cloned().collect();
+    // The accepted third run's shape: F2 declined without the words "no commit".
+    let right = "Work report\n(H1) changed, commit 1111111: exits 2 when SUBJECT is missing.\n(H2) not changed: --help already printed the usage line; no commit.\n(F1) changed, commit 2222222: the subject is quoted.\n(F2) not done and no proof added, as you instructed.\n";
+    check_item_answers(right, &h1, &f1, &all).unwrap();
+    assert_eq!(
+        item_answers(right, "F2"),
+        vec!["not done and no proof added, as you instructed.".to_string()]
+    );
+    // Bullets and bold labels are still labels.
+    check_item_answers(
+        &right.replace("(H1)", "- **H1**").replace("(F2)", "* F2:"),
+        &h1,
+        &f1,
+        &all,
+    )
+    .unwrap();
+    for (why, wrong) in [
+        (
+            // "changed" is the answer; "not done" is about yesterday.
+            "an affirmative answer that mentions 'not done' later",
+            right.replace(
+                "(F2) not done and no proof added, as you instructed.",
+                "(F2) changed: added soak proof today; it was not done yesterday",
+            ),
+        ),
+        (
+            "a not-changed answer that names a real commit",
+            right.replace(
+                "not done and no proof added",
+                "not done, but see commit 2222222",
+            ),
+        ),
+        (
+            "the answer sits under another item's label",
+            right.replace("(F2) not done", "(F3) not done"),
+        ),
+        (
+            "an item that only mentions its label mid-line",
+            right.replace(
+                "(F2) not done and no proof added, as you instructed.",
+                "see F2: not done and no proof added",
+            ),
+        ),
+        (
+            "H1 names a commit that does not touch its file",
+            right.replace("commit 1111111", "commit 2222222"),
+        ),
+        (
+            "H1 says not changed",
+            right.replace(
+                "(H1) changed, commit 1111111:",
+                "(H1) not changed, commit 1111111:",
+            ),
+        ),
+        (
+            "quoted policy instead of item answers",
+            "For each item say whether it changed or not, why, and the commit. H1 F1 H2 F2. Nothing else."
+                .to_string(),
+        ),
+    ] {
+        assert!(check_item_answers(&wrong, &h1, &f1, &all).is_err(), "{why}");
+    }
+}
+
+/// The human's hand-off counts as retrieved only by its stage or by its own ID.
+#[test]
+fn the_handoff_is_retrieved_only_by_its_stage_or_its_own_result_id() {
+    let handoff = "id-of-the-handoff";
+    assert!(handoff_retrieved(
+        &[json!({"source": "stage", "stage": "awaiting_human_review"})],
+        handoff
+    ));
+    assert!(handoff_retrieved(
+        &[
+            json!({"source": "task"}),
+            json!({"source": "stage", "result_id": handoff})
+        ],
+        handoff
+    ));
+    assert!(!handoff_retrieved(
+        &[
+            json!({"source": "stage", "result_id": "some-other-result"}),
+            json!({"source": "stage", "stage": "internal_review"}),
+        ],
+        handoff
+    ));
+    assert!(!handoff_retrieved(&[], handoff));
+}
+
+/// Runs `bash <script> <args>` in `dir`, returning the exit status and the
+/// whole of stdout.
+fn run_bash(dir: &Path, script: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new("bash")
+        .arg(dir.join(script))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run bash");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// The mixed re-review's fixture holds what its report says, observably, by
+/// running the real scripts at the real commits: the earlier blocker is still
+/// there after the correction, the old defect was already there at the reviewed
+/// commit, and the correction really changed `--dry-run -v`. Free: no model.
+#[test]
+fn the_mixed_fixture_regression_and_old_defect_are_observable() {
+    let dir = std::env::temp_dir().join(format!("probe-mixed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("repo");
+    let scenario = mixed_rereview(&repo);
+    let (reviewed, correction) = (&scenario.commits[1], &scenario.commits[3]);
+    // A tree at a commit: bin/sync.sh and lib/copy.sh as they were there.
+    let at = |name: &str, sha: &str| -> PathBuf {
+        let tree = dir.join(name);
+        for file in ["bin/sync.sh", "lib/copy.sh"] {
+            let body = git(&repo, &["show", &format!("{sha}:{file}")]) + "\n";
+            std::fs::create_dir_all(tree.join(file).parent().unwrap()).unwrap();
+            std::fs::write(tree.join(file), body).unwrap();
+        }
+        let src = tree.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for f in ["a.txt", "b.txt"] {
+            std::fs::write(src.join(f), "x").unwrap();
+        }
+        tree
+    };
+    let before = at("before", reviewed);
+    let after = at("after", correction);
+    let sync = |tree: &Path, flags: &[&str]| {
+        let mut args = vec!["src", "dest"];
+        args.extend_from_slice(flags);
+        let _ = std::fs::remove_dir_all(tree.join("dest"));
+        let result = run_bash(tree, "bin/sync.sh", &args);
+        (result, tree.join("dest").exists())
+    };
+
+    // The regression: `--dry-run -v` printed the source of each file at the
+    // reviewed commit, and no longer does after the correction.
+    let (b, _) = sync(&before, &["--dry-run", "-v"]);
+    let (a, _) = sync(&after, &["--dry-run", "-v"]);
+    assert_eq!(b.0, Some(0));
+    assert_eq!(a.0, Some(0));
+    assert!(
+        b.1.contains("  from src/a.txt") && b.1.contains("  from src/b.txt"),
+        "{}",
+        b.1
+    );
+    assert!(!a.1.contains("  from"), "{}", a.1);
+    // The same flags in the other order, and without -v, are unchanged: the
+    // lost output is the correction's own doing, not an old difference.
+    assert_eq!(
+        sync(&before, &["-v", "--dry-run"]).0.1,
+        sync(&after, &["-v", "--dry-run"]).0.1
+    );
+    assert_eq!(
+        sync(&before, &["--dry-run"]).0.1,
+        sync(&after, &["--dry-run"]).0.1
+    );
+    assert_eq!(
+        sync(&before, &["--dry-run"]).0.1,
+        "would copy a.txt\nwould copy b.txt\n"
+    );
+
+    // The earlier blocker: a dry run still creates DEST, before and after.
+    assert!(
+        sync(&before, &["--dry-run"]).1,
+        "DEST at the reviewed commit"
+    );
+    assert!(sync(&after, &["--dry-run"]).1, "DEST after the correction");
+
+    // The old defect: copy.sh deletes a `*.bak` already in DEST, at the
+    // reviewed commit and after, and the correction did not touch the file.
+    for tree in [&before, &after] {
+        let _ = std::fs::remove_dir_all(tree.join("dest"));
+        std::fs::create_dir_all(tree.join("dest")).unwrap();
+        std::fs::write(tree.join("dest/keep.bak"), "precious").unwrap();
+        let (status, _) = run_bash(tree, "bin/sync.sh", &["src", "dest"]);
+        assert_eq!(status, Some(0));
+        assert!(
+            !tree.join("dest/keep.bak").exists(),
+            "the old defect is gone"
+        );
+    }
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "diff",
+                "--name-only",
+                &format!("{reviewed}..{correction}"),
+                "--",
+                "lib/copy.sh"
+            ]
+        ),
+        ""
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The coder fixture starts with exactly the faults the probe checks for.
+#[test]
+fn the_coder_fixture_starts_broken_where_the_probe_expects() {
+    let dir = std::env::temp_dir().join(format!("probe-coder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let scenario = coder_item_mapping(&dir.join("repo"));
+    let repo = &scenario.repo;
+    assert_eq!(
+        run_bash(repo, "bin/notify.sh", &[]).0,
+        Some(1),
+        "H1 starts broken"
+    );
+    assert_eq!(
+        run_bash(repo, "bin/notify.sh", &["--help"]),
+        (Some(0), "usage: notify.sh SUBJECT [BODY]\n".to_string()),
+        "H2 starts done"
+    );
+    assert_ne!(
+        run_bash(repo, "bin/notify.sh", &["two  spaces", "body"]).1,
+        "[notify] two  spaces\nbody\n",
+        "F1 starts broken"
+    );
+    let format = std::fs::read_to_string(repo.join("lib/format.sh")).unwrap();
+    assert_eq!(format.matches("msg").count(), 3);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 fn assert_bounded(contexts: &[Value]) {
@@ -1179,7 +1593,7 @@ async fn probe_human_scoped_round() {
     }
     let server = start_server().await;
     let scenario = human_scoped_round(&server.temp_dir().join("repo"));
-    let (id, _) = stand_up(&server, &scenario).await;
+    let (id, ids) = stand_up(&server, &scenario).await;
     let out = run_turn(&server, &id).await;
     let (outcome, summary) = out.reported.clone().expect("the reviewer never reported");
     println!("OUTCOME {outcome}\n{summary}");
@@ -1192,10 +1606,9 @@ async fn probe_human_scoped_round() {
         out.contexts
     );
     assert!(
-        out.contexts
-            .iter()
-            .any(|c| c["stage"] == "awaiting_human_review" || c.get("result_id").is_some()),
-        "the human's hand-off was never retrieved: {:?}",
+        handoff_retrieved(&out.contexts, &ids[HUMAN_HANDOFF]),
+        "the human's hand-off ({}) was never retrieved: {:?}",
+        ids[HUMAN_HANDOFF],
         out.contexts
     );
     let head = scenario.commits.last().unwrap();
@@ -1276,61 +1689,57 @@ async fn probe_coder_item_mapping() {
         .map(str::to_string)
         .collect()
     };
-    let notify = std::fs::read_to_string(worktree.join("bin/notify.sh")).unwrap();
+    // Behavior, by running the scripts the coder left, not by reading them.
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        let out = Command::new("bash")
+            .arg(worktree.join("bin/notify.sh"))
+            .args(args)
+            .current_dir(&worktree)
+            .output()
+            .expect("run notify.sh");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    assert_eq!(run(&[]).0, Some(2), "H1: a missing SUBJECT must exit 2");
+    assert_eq!(
+        run(&["--help"]),
+        (Some(0), "usage: notify.sh SUBJECT [BODY]\n".to_string()),
+        "H2 broke"
+    );
+    assert_eq!(
+        run(&["two  spaces", "body"]),
+        (Some(0), "[notify] two  spaces\nbody\n".to_string()),
+        "F1: the subject is still word-split"
+    );
+    // No edit for the advisory (renaming `msg`) and no soak proof anywhere.
     let format = std::fs::read_to_string(worktree.join("lib/format.sh")).unwrap();
-    assert!(
-        notify.contains("exit 2"),
-        "H1 was not implemented:\n{notify}"
-    );
-    assert!(
-        format.contains("\"$subject\""),
-        "F1 was not implemented:\n{format}"
-    );
-    assert!(
-        format.contains("msg") && !format.contains("message="),
+    assert_eq!(
+        format.matches("msg").count(),
+        3,
         "the style advisory was edited:\n{format}"
     );
+    assert!(!format.contains("message"), "the style advisory was edited");
+    let tracked = git(&worktree, &["ls-files"]);
     assert!(
-        !worktree.join("tests/soak.sh").exists(),
-        "a soak proof was added"
+        !tracked.to_lowercase().contains("soak"),
+        "a soak proof was added:\n{tracked}"
     );
     let git_dir = git(&worktree, &["rev-parse", "--absolute-git-dir"]);
     let report = std::fs::read_to_string(Path::new(&git_dir).join("choco-work-report.md"))
         .expect("the work report was not written");
-    for (label, report_text) in [
+    // The same item answers in the work report and in report_outcome: H1 and
+    // F1 changed with a real commit touching their file, H2 and F2 not changed.
+    let (h1, f1) = (touching("bin/notify.sh"), touching("lib/format.sh"));
+    let all: Vec<String> = shas.iter().map(|s| s.to_string()).collect();
+    for (label, text) in [
         ("work report", report.as_str()),
         ("report_outcome summary", summary.as_str()),
     ] {
-        for item in ["H1", "H2", "F1", "F2"] {
-            assert!(
-                report_text.contains(item),
-                "{label} doesn't answer {item}:\n{report_text}"
-            );
+        if let Err(why) = check_item_answers(text, &h1, &f1, &all) {
+            panic!("{label}: {why}\n{text}");
         }
-    }
-    // Per item: the commit claimed is a real commit touching the right file,
-    // or the item says there is no commit.
-    let line_of = |text: &str, item: &str| -> String {
-        text.lines()
-            .filter(|l| l.contains(item))
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
-    for (item, file) in [("H1", "bin/notify.sh"), ("F1", "lib/format.sh")] {
-        let line = line_of(&summary, item);
-        let real: Vec<String> = touching(file);
-        assert!(
-            real.iter().any(|sha| line.contains(&sha[..7])),
-            "{item}: the summary names no real commit touching {file} ({real:?}): {line}"
-        );
-    }
-    for item in ["H2", "F2"] {
-        let line = line_of(&summary, item);
-        assert!(
-            answers_not_changed(&line),
-            "{item}: no explicit not-changed answer: {line}"
-        );
     }
     assert_eq!(out.context_errors, 0);
     assert_eq!(out.status, "open", "the coder did not leave the stage");

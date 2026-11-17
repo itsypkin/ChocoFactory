@@ -264,8 +264,10 @@ doesn't erase an earlier failure.
 ## 5. Decide
 
 Re-read your predictions and your walks. Every defect you found goes under
-Findings, whether or not it changes the verdict: mark the ones that don't
-block as minor, and say plainly which ones do. Never make a finding
+Findings, whether or not it changes the verdict. Say plainly which ones block.
+A finding that doesn't block keeps its real seriousness: an out-of-scope old
+defect stays serious and nonblocking, and only a genuinely small defect is
+marked minor. Never make a finding
 conditional — "acceptable if documented", "fine with a comment": the
 next lap reads your report as the bar, and will meet the condition
 instead of fixing the defect. "Not worth reporting" is not a category —
