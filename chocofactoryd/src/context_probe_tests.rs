@@ -1092,6 +1092,26 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
 /// Whether a report affirms "this is a first review". A conditional ("if
 /// this is a first review") or a refusal ("I do not treat this as a first
 /// review") is not an affirmation.
+/// An item line that explicitly says the item was not changed: the literal
+/// words "no commit" are one way to say it, not the only one.
+fn answers_not_changed(line: &str) -> bool {
+    let line = line.to_lowercase();
+    ["no commit", "not changed", "no change", "not done"]
+        .iter()
+        .any(|phrase| line.contains(phrase))
+}
+
+#[test]
+fn a_not_changed_item_may_say_so_without_the_words_no_commit() {
+    // The recorded third coder run's answer for the declined proof item.
+    assert!(answers_not_changed(
+        "(f2) not done and no proof added, as you instructed"
+    ));
+    assert!(answers_not_changed("(h2) not changed: no commit, as asked"));
+    // A line that only mentions the item, with no answer, is not accepted.
+    assert!(!answers_not_changed("(f2) the soak proof, see the spec"));
+}
+
 fn invents_first_review(summary: &str) -> bool {
     let lower = summary.to_lowercase();
     lower.match_indices("first review").any(|(at, _)| {
@@ -1308,10 +1328,8 @@ async fn probe_coder_item_mapping() {
     for item in ["H2", "F2"] {
         let line = line_of(&summary, item);
         assert!(
-            line.contains("no commit")
-                || line.contains("not changed")
-                || line.contains("no change"),
-            "{item}: no explicit no-commit answer: {line}"
+            answers_not_changed(&line),
+            "{item}: no explicit not-changed answer: {line}"
         );
     }
     assert_eq!(out.context_errors, 0);
