@@ -4083,7 +4083,17 @@ async fn task_prefix_status_and_events() {
             "p1",
             "open",
         ));
+        // Holds `abcdef01` mid-id, so it is no match for that prefix.
+        s.tasks.push(FxTask::new(
+            "0000abcdef01-4222-8333-000000000010",
+            "p1",
+            "open",
+        ));
     });
+    let out = run_choco_json(&server.base_url, &["task", "status", "abcdef01"]).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(out.json()["id"], "abcdef01-1111-4222-8333-000000000008");
+    server.take_requests();
     for refused in ["ABCDEF01", "feedbeef"] {
         let out = run_choco_json(&server.base_url, &["task", "status", refused]).await;
         assert_eq!(out.code, Some(1), "{refused}");
