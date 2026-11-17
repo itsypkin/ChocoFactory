@@ -226,7 +226,10 @@ moves the task on, into `revising`.
   and let the task notice (it moves to `done` by itself), or send a note
   saying CI is green and no code change is needed. The note costs a coder
   lap and a review lap, because resuming always goes through `revising`.
-- The note is templated into the coder's prompt verbatim. Make it
+- The coder and the reviewer read the note with `get_context`, as the result
+  that left `escalate_to_human`; it is not pasted into their prompts. It
+  governs the branch through later internal review rounds until another human
+  instruction replaces what it changes. Make it
   self-contained: list every item in full. List them under MUST DO and
   ACCEPTED COSTS, and ask the coder to copy the accepted costs into its work
   report, the text the PR description is written from.
@@ -264,8 +267,11 @@ is only `/approve` is refused. The answer goes to `revising`, and the internal
 reviewer is shown it too and treats it as your decision, so where it conflicts
 with the spec the answer wins.
 
-- The answer is templated into the prompts verbatim, and only the latest one is
-  kept. Make it self-contained: say what to do and what to leave alone.
+- The coder and the reviewer read the answer with `get_context`, as the result
+  that left `blocker`, by following the links from where their turn started.
+  It is not pasted into their prompts, and each answer is its own recorded
+  result (subject to event retention). Make it self-contained: say what to do
+  and what to leave alone.
 - If the answer doesn't settle it, the coder reports `blocked` again and the
   task waits here again. No loop count is used up by a block or an answer.
 
@@ -295,12 +301,19 @@ the writer.
 
 ## Getting your review items done when the coder ignores them
 
-After `/request-changes`, the coder often works from the internal reviewer's
-earlier summary instead of your comment. Work in this order:
+After `/request-changes`, the coder and the internal reviewer both read your
+request themselves, but items can still be dropped or answered wrongly. Work
+in this order:
 
-1. **Let the next `internal_review` run.** It re-reads the PR's comments. If
-   it rejects and names your items, they reach the coder through the
-   reviewer's summary, which the coder does follow.
+1. **Let the next `internal_review` run.** It treats your request as the bound
+   of the round, and checks the coder's item-by-item answers (changed or not,
+   why, commits) against git. It may block only on your items and defects the
+   corrections introduced; other old defects it notices are reported as
+   prominent non-blocking advisories. Its rejection reaches the coder through
+   its recorded report. If it can't read the history it needs (a task from
+   before results were recorded, or a pruned link) it refuses to approve and
+   names what is unavailable: read that as missing context, not as a verdict
+   on the code.
 2. **If `internal_review` keeps rejecting and the task escalates**, paste every item in full into
    the note: `choco task send <id> --text "..."`. A note that only points at
    the PR ("same issues", "read the PR") doesn't work: the coder may never

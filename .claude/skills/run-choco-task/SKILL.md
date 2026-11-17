@@ -188,8 +188,9 @@ command in step 3 and the pre-merge check in step 4.
 
 ## 2. Write the spec
 
-The `--prompt` is the whole brief. It is rendered into the coder's turn, the
-reviewer's, and every `revising` lap. Write a technical spec, not a
+The `--prompt` is the whole brief. The coder and the reviewer read it with the
+read-only `get_context` tool at the start of each of their turns, `revising`
+laps included; it is not pasted into their prompts. Write a technical spec, not a
 sentence: the problem grounded in real symptoms, what to build, the design
 decisions with their reasons, the required tests, done criteria, and an
 explicit out-of-scope list.

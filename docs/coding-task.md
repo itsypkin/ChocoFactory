@@ -7,7 +7,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | Stage | What happens |
 |---|---|
 | `coding` | The `coder` agent implements the spec in the task's own git worktree. If the spec's rules leave it no way forward (for example, a pinned dependency that doesn't build and a spec that forbids substituting another), it can instead stop at `blocker`. |
-| `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec, and checks the coder's work report against the code. It approves (the task goes to `describe_pr`), or sends the task to `revising`. |
+| `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec, and checks the coder's work report against the code. It approves (the task goes to `describe_pr`), or sends the task to `revising`. It reads the spec, its earlier report and your hand-offs through the context tool (see [docs/context.md](context.md)), and what may block depends on the round: see "What the internal reviewer may block on" below. |
 | `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`, or stops at `blocker`. |
 | `describe_pr` | A separate, read-only `writer` agent writes the PR's description from the spec, the coder's work report, the internal reviewer's report and the branch's commits and diff, and reports it as its summary. Every approval goes through it, so the first open and every round after a `/request-changes`, red CI or a conflict get a freshly written description. Read-only means choco checks the worktree when the turn ends: a change it detects (files, git state or branch) parks the task as stuck, and choco does not undo the change. Inspect the worktree and reset any change before `choco task retry`; a plain retry can take the retained change as its new starting point. Ignored files, other git metadata and anything outside the worktree are not checked. |
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request, with the writer's description in the body. |
@@ -37,7 +37,8 @@ way forward is irreversible, weakens security or costs far more than the
 spec suggests.
 
 From then on the coder, the internal reviewer and the writer work from the
-planner's report, not from your `--prompt`. Read it with:
+planner's report, not from your `--prompt` (the coder and reviewer read it
+through the context tool; the writer's prompt carries it). Read it with:
 
 ```
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
@@ -110,14 +111,36 @@ The rest of the comment is yours to write however you like — put the marker
 on the last line and your review above it. A comment that reads "Two
 findings, one worth fixing before merge." followed by your prose, and then
 a final line containing only `/request-changes`, sends the coder back round.
-The workflow hands the coder every qualifying comment (see the points
-below), oldest first, in its prompt, and after them every qualifying review
-(oldest first) with that review's inline comments; the coder doesn't have to
-fetch them. Anything posted after the poll read the PR isn't in the prompt,
-so the coder is told to check for it.
+The workflow records every qualifying comment (see the points below), oldest
+first, and after them every qualifying review (oldest first) with that review's
+inline comments, as your hand-off. The coder and the internal reviewer read it
+through the context tool; it is not in their prompts, and the coder doesn't
+have to fetch it from GitHub. Anything posted after the poll read the PR isn't
+in the hand-off, so the coder is told to check for it.
 
 The coder makes only the changes you ask for, so repeat in your comment any
 earlier review finding you want fixed.
+
+### What the internal reviewer may block on
+
+The reviewer fixes the round's scope before it weighs severity. A *first review*
+covers the whole branch, and the reviewer calls it first only when the recorded
+history is positively the initial one. In a round the reviewer started, only
+its unresolved earlier blockers and defects or regressions the correction
+commits caused can block; a defect that was already there at the previously
+reviewed commit is reported as a prominent non-blocking advisory, even if it is
+serious. In a round your request started, only your request, what it needs and
+defects within those corrections can block, and that stays true through later
+internal rounds until you send another instruction. A cost you accept (for
+example a check that was not made) stays accepted. The coder answers every item
+with whether it changed it, why and the commits, and the reviewer checks those
+commits against git. When the history a review depends on is unavailable (a
+task from before results were recorded, a pruned link, an unreadable capture),
+the reviewer refuses to approve and names exactly what is missing; a GitHub
+hand-off can also carry its own truncation notice, so what the reviewer reads
+is not always the complete original request. These are instructions to models,
+not enforced rules, and the repository's own build and test gate always
+applies.
 
 Reviews follow these rules:
 

@@ -916,7 +916,7 @@ ignored folders, and anything inside `.git`, is outside the check.
 ### Templates
 
 A later stage reads a branch with `{{ stages.<branch>.<field> }}`. A branch
-may read its own previous capture (as a re-reviewer does) and anything
+may read its own previous capture (as a re-reviewer in a custom workflow can) and anything
 captured before the group was entered. It may not reference a sibling:
 `branch '{branch}' of parallel stage '{group}' has {placeholder} in its
 {field}, but '{sibling}' is a sibling branch that runs at the same time, so

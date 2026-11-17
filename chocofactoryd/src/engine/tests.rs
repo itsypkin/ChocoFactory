@@ -7827,11 +7827,9 @@ async fn the_real_coding_task_review_gate_takes_a_choco_reply() {
     )
     .unwrap();
     let (rendered, _) = crate::template::render(&prompt, &render_payload).unwrap();
-    let from = rendered.find("## The human's review").unwrap();
-    let to = rendered.find("## Internal reviewer's summary").unwrap();
-    let section = &rendered[from..to];
-    assert!(section.contains("FIX X"), "{section}");
-    assert!(!section.contains("/request-changes"), "{section}");
+    // The coder reads the review with `get_context`; the prompt doesn't carry it.
+    assert!(!rendered.contains("FIX X"), "{rendered}");
+    assert!(rendered.contains("Get your context first"), "{rendered}");
 
     // Approve at the second arrival.
     engine
@@ -7985,12 +7983,15 @@ async fn the_real_coding_task_sends_a_conflicting_pr_to_revising() {
     )
     .unwrap();
     let (rendered, _) = crate::template::render(&prompt, &payload).unwrap();
-    let from = rendered.find("## The human's review").unwrap();
-    let to = rendered.find("## Internal reviewer's summary").unwrap();
+    // The conflict note is a recorded hand-off the coder reads with
+    // `get_context`; it is not templated into the prompt.
     assert!(
-        rendered[from..to].contains("merge conflicts with its base branch"),
-        "{}",
-        &rendered[from..to]
+        !rendered.contains("merge conflicts with its base branch"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("the `base_conflict` stage ended"),
+        "{rendered}"
     );
 }
 
@@ -8864,50 +8865,33 @@ const REVISING_BLOCKED_SUMMARY: &str = "REVISING-BLOCKED-SUMMARY: still `serde =
 const BLOCKER_ANSWER_TEXT: &str =
     "BLOCKER-ANSWER-LINE-ONE: use serde 1.x.\nBLOCKER-ANSWER-LINE-TWO: that is my decision.";
 
-/// The text of `prompt` strictly between `from` and `to`.
-fn between<'a>(prompt: &'a str, from: &str, to: &str) -> &'a str {
-    let start = prompt
-        .find(from)
-        .unwrap_or_else(|| panic!("no {from:?} in:\n{prompt}"))
-        + from.len();
-    let end = start
-        + prompt[start..]
-            .find(to)
-            .unwrap_or_else(|| panic!("no {to:?} after {from:?} in:\n{prompt}"));
-    &prompt[start..end]
-}
-
-/// A coder lap that resumes from `blocker` carries the answer once, under
-/// its heading, and its own reports under theirs.
+/// A coder lap that resumes from `blocker` is told why it is back, and its
+/// prompt carries neither its own earlier reports nor the human's answer: it
+/// reads them with `get_context`, from the results the engine recorded.
 fn assert_blocker_resume_prompt(prompt: &str, from_coding: &str, from_revising: Option<&str>) {
     assert!(
         prompt.contains("the `blocker` stage ended with the outcome `resumed`"),
         "{prompt}"
     );
-    let report = between(
-        prompt,
-        "## Your blocker report",
-        "## A human's answer to your blocker",
-    );
-    let coding = between(report, "From `coding`:", "From `revising`:");
-    assert!(coding.contains(from_coding), "{report}");
-    let revising = &report[report.find("From `revising`:").unwrap()..];
-    match from_revising {
-        Some(text) => assert!(revising.contains(text), "{report}"),
-        None => assert!(!revising.contains("SUMMARY"), "{report}"),
-    }
-    let answer = between(
-        prompt,
-        "## A human's answer to your blocker",
-        "## When you're done",
-    );
+    assert!(prompt.contains("Get your context first"), "{prompt}");
     for line in BLOCKER_ANSWER_TEXT.lines() {
-        assert!(answer.contains(line), "{answer}");
-        assert_eq!(prompt.matches(line).count(), 1, "{line}:\n{prompt}");
+        assert!(!prompt.contains(line), "{line}:\n{prompt}");
     }
     for text in [from_coding].into_iter().chain(from_revising) {
-        assert_eq!(prompt.matches(text).count(), 1, "{text}:\n{prompt}");
+        assert!(!prompt.contains(text), "{text}:\n{prompt}");
     }
+}
+
+/// The answer the task acted on is recorded as the capture of the result that
+/// left `blocker`, which is what the coder and the reviewer then read.
+async fn assert_blocker_answer_recorded(pool: &SqlitePool, task_id: &str) {
+    let answers: Vec<Value> = stage_results(pool, task_id)
+        .await
+        .into_iter()
+        .filter(|e| e.payload["source_stage"] == "blocker")
+        .map(|e| e.payload["capture"].clone())
+        .collect();
+    assert_eq!(answers, vec![json!(BLOCKER_ANSWER_TEXT)]);
 }
 
 /// (#333) A coder that reports `blocked` from `coding` parks the task at
@@ -9021,9 +9005,9 @@ async fn a_coder_blocked_in_coding_parks_at_blocker_and_the_answer_reaches_coder
         None,
     );
     let review = saved_prompt(&scripts_dir, "reviewer", 1);
-    let marked = between(&review, "<blocker_answer>\n", "</blocker_answer>");
-    assert_eq!(marked.trim_end(), BLOCKER_ANSWER_TEXT, "{review}");
-    assert_eq!(review.matches("BLOCKER-ANSWER-LINE-ONE").count(), 1);
+    assert!(!review.contains("BLOCKER-ANSWER-LINE-ONE"), "{review}");
+    assert!(review.contains("Get the context first"), "{review}");
+    assert_blocker_answer_recorded(&pool, &task_id).await;
 }
 
 /// (#333) `blocked` from `revising` parks at `blocker` too and leaves
@@ -9104,12 +9088,11 @@ async fn a_coder_blocked_in_revising_keeps_the_review_count_and_gets_both_report
         coded,
         Some(REVISING_BLOCKED_SUMMARY),
     );
-    // Reviewer call 2 used the default approval and was shown the answer.
+    // Reviewer call 2 used the default approval; it reads the answer with
+    // `get_context` rather than in its prompt.
     let review = saved_prompt(&scripts_dir, "reviewer", 2);
-    assert_eq!(
-        between(&review, "<blocker_answer>\n", "</blocker_answer>").trim_end(),
-        BLOCKER_ANSWER_TEXT
-    );
+    assert!(!review.contains("BLOCKER-ANSWER-LINE-ONE"), "{review}");
+    assert_blocker_answer_recorded(&pool, &task_id).await;
     let trail = stage_trail(&pool, &task_id).await;
     assert_eq!(
         trail[..6],
@@ -9274,7 +9257,7 @@ async fn the_real_coding_task_workflow_reopens_the_same_pr_when_changes_are_requ
         "{review:?}"
     );
     assert!(review.contains("HUMAN ITEM: fix the release build"));
-    // ...and it renders into the coder's prompt under its heading.
+    // ...and the coder's prompt doesn't carry it: it reads it with `get_context`.
     let prompt_src = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/prompts/coder-revise.md"),
     )
@@ -9283,9 +9266,10 @@ async fn the_real_coding_task_workflow_reopens_the_same_pr_when_changes_are_requ
     render_payload["arrival"] =
         json!({ "from": "awaiting_human_review", "outcome": "changes_requested" });
     let (prompt, _) = crate::template::render(&prompt_src, &render_payload).unwrap();
-    let heading = prompt.find("## The human's review").unwrap();
-    let item = prompt.find("HUMAN ITEM: fix the release build").unwrap();
-    assert!(heading < item, "{prompt}");
+    assert!(
+        !prompt.contains("HUMAN ITEM: fix the release build"),
+        "{prompt}"
+    );
 
     // The load-bearing one: a second `gh pr create` is exactly the
     // failure #78's second half describes, and it would have shown up

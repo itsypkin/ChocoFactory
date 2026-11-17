@@ -197,3 +197,38 @@ environment or default-port fallback. Neither listing tools nor a report call
 contacts the daemon, so an unreachable daemon cannot stop a turn reporting.
 When `claude_settings` were not applied, only `claude_settings_rejected` is
 offered, for list and call alike.
+
+## How the shipped coder and reviewer prompts use it
+
+In `coding-task` and `coding-task-planned` the coder's and the reviewer's
+turns no longer carry the task text, the planner's report, an earlier review,
+the coder's earlier reports or a human's hand-off in their prompts (only the
+title, the closing issues and, for the coder, the arrival). They read them with
+`get_context`:
+
+- the task: `{"source":"task"}`; in the planned workflow the whole planner
+  report instead: `{"source":"stage","stage":"spec_check","outcome":"ready"}`;
+- the governing review and the coder's latest report, by stage name, then the
+  result named as `anchor_id` and each `previous_result_id` after it, through
+  checks, the description writer, publication, blocker answers, escalation
+  notes and human gates. Which result is a human's instruction depends on its
+  source stage, kind and outcome and on its text: a gate that left with
+  `retry`, `timeout` or `merged`, or an automatic conflict note, isn't one.
+
+A human instruction stays the bound of the work through later internal review
+rounds until another human instruction replaces what it changes. The experimental
+review panel's all-round reviewer and its lead use the applied `lead_review`
+result as the previous governing review: a parallel branch's report isn't a
+stage result, so branch history can't be retrieved, and the lead reads the
+current branch reports inline.
+
+When something a turn essentially needs can't be read (a tool error, an
+`unavailable` answer, a result with no capture, a capture of the wrong type, a
+pruned parent), the coder reports `blocked` and the reviewer requests changes,
+each naming the exact limitation. Neither treats a gap as a first review or as
+permission, and neither retries in a loop. An older task, or one whose history
+was pruned, can therefore be held for a human where it used to be reviewed
+from a stale inline copy; this is accepted, and nothing here reconstructs
+missing history. A GitHub hand-off can carry its own truncation notice, so a
+complete capture isn't always the complete original request. Whether a model
+follows these instructions isn't enforced by the daemon.

@@ -1,10 +1,14 @@
 # `coding-task` with a spec check in front. It is a separate workflow so the
 # two can be compared on real runs. Every stage from `coding` on is
 # `coding-task.yaml`'s; read the rationale in that file's comments. Only
-# four prompt files differ, and each is its `coding-task` counterpart with
-# `{{ task.input }}` replaced by the planner's report. Tests in
-# `chocofactoryd/src/config_root.rs` pin both facts, so an edit to
-# `coding-task.yaml` or to one of those prompts must be copied here too.
+# four prompt files differ. The planned writer turn is its `coding-task`
+# counterpart with `{{ task.input }}` replaced by the planner's report, and a
+# test in `chocofactoryd/src/config_root.rs` pins that. The planned coder and
+# reviewer turns (three files) don't inline anything: they read the agreed spec
+# with `get_context` (source `stage`, stage `spec_check`, outcome `ready`)
+# where the ordinary ones read the task (source `task`), and the rest of their
+# rules match their counterparts. An edit to `coding-task.yaml` or to one of
+# those prompts must be copied here too.
 name: coding-task-planned
 worktree: true
 roles:
@@ -34,7 +38,9 @@ roles:
 stages:
   # Checks the task's spec against the code the coder will start from, and
   # writes the hardened version that every later stage reads in place of
-  # the task text (`{{ stages.spec_check.summary }}`). It reports `ready`
+  # the task text. The coder and the reviewer fetch it with `get_context`
+  # (`{"source":"stage","stage":"spec_check","outcome":"ready"}`) and read the
+  # whole planner report; it isn't templated into their prompts. It reports `ready`
   # when nothing is left to decide. It reports `needs_input` to park the
   # task for a human's answers, which it does only when it would otherwise
   # have to guess what the user wants. Because of `report_sections:`, the

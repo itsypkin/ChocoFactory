@@ -83,9 +83,14 @@ stages:
   # `done`; `lead_review` decides. Only `internal_review` builds and runs the
   # tests: N building branches are N concurrent builds, and concurrent
   # branches can't share one scratch build. The other two only read.
-  # The branch is named `internal_review` so the shipped
-  # `reviewer-turn-planned.md`, which reads `stages.internal_review.summary`
-  # as its own previous report, works unchanged.
+  # The branch is named `internal_review` because `writer-turn-planned.md` and
+  # `open_pr` read the all-round report under that name. A branch's report is
+  # not an applied stage result: only the group's departure is, so nothing can
+  # retrieve a branch's earlier laps. This panel's `reviewer-turn-planned.md`
+  # therefore retrieves the lead's applied report
+  # (`{"source":"stage","stage":"lead_review"}`) as the previous governing
+  # review, and it doesn't promise branch history or an aggregate of the
+  # branches' captures. The lead reads the current branch reports inline.
   review_panel:
     kind: parallel
     branches:
@@ -122,7 +127,11 @@ stages:
           - Dismissed
     on: { done: lead_review }
 
-  # The lead owns the loop guard: a group can't have one.
+  # The lead owns the loop guard: a group can't have one. It reads this lap's
+  # three branch reports inline (they aren't retrievable results) and fetches
+  # the spec, the governing human request, the coder's report and its own
+  # previous report with `get_context`. Its summary carries `Reviewed: <full
+  # HEAD SHA>`; `report_sections` doesn't enforce it.
   lead_review:
     kind: agent_turn
     role: lead

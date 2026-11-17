@@ -7,7 +7,9 @@ Read this while watching a task, when its behaviour surprises you.
   branch, fixes what it finds, and decides the design choices your
   intent implies. It asks only when it would have to guess what you
   want.
-  Its report replaces your `--prompt` for every later stage. The planner
+  Its report replaces your `--prompt` for every later coder and reviewer turn:
+  they fetch it with `get_context` (the latest `spec_check` result with
+  outcome `ready`) and read the whole report. The planner
   can't use the file-editing tools, and a turn that changes HEAD or
   `git status` anyway parks the task as `stuck`, with the change left in
   place for you to inspect. The check covers HEAD, the branch, `git status`
@@ -20,7 +22,15 @@ Read this while watching a task, when its behaviour surprises you.
 - **coding / revising.** The coder's turn is complete when
   it has called `report_outcome` and its run then ends cleanly, and the
   process exits and is cleaned up; the call alone does not complete it, and
-  neither does stopping output. It reports `done`, or
+  neither does stopping output. The initial coder turn's prompt
+  carries only the title and the closing issues, with no arrival; a revision
+  turn's carries the title, the closing issues and the arrival. The task text (or the planner's report) and, on `revising`, the
+  reviewer's report, your hand-offs and its own earlier reports are read with
+  `get_context`, by following the result links from where the turn started.
+  When it can't read what it essentially needs, it reports `blocked` naming
+  the missing lookup instead of guessing. It answers every requested item and
+  in-scope blocking finding with changed or not, the reason and the commits.
+  It reports `done`, or
   `blocked` when the spec's rules leave it no way forward (see the `blocker`
   entry). A turn that goes quiet
   without reporting is nudged, then closed, unless its CLI says background
@@ -34,16 +44,27 @@ Read this while watching a task, when its behaviour surprises you.
   treated as already handled.
 - **blocker.** Reached when the coder reports `blocked` from `coding` or
   `revising`. Waits, with no time limit, for `choco task send`. The answer goes
-  to `revising`, and the internal reviewer is shown it as your decision: where
-  it conflicts with the spec, the answer wins. Only your latest answer is kept in the
-  captured value the workflow's templates read; each answer the task acted on is
-  also recorded as its own stage result (see `docs/context.md`), subject to the
-  daemon's event retention.
+  to `revising`, and the coder and the internal reviewer read it with
+  `get_context` as your decision: where it conflicts with the spec, the answer
+  wins. Each answer the task acted on is recorded as its own stage result (see
+  `docs/context.md`), subject to the daemon's event retention.
   It resets no loop count, and a reply that is only `/approve` is refused.
   If the task's PR is merged meanwhile, the task moves to `done` by itself
   (the same merge-only check as `escalate_to_human`; with no PR yet, nothing
   to check).
-- **internal_review.** The reviewer is told the task's closes list. It checks
+- **internal_review.** The reviewer reads the task or spec, its own previous
+  report and your hand-offs with `get_context`, and decides the round before
+  weighing anything else. A first review (called first only when the recorded
+  chain is positively the initial one) covers the whole branch. After a
+  reviewer's own rejection, only its unresolved blockers and defects the
+  corrections caused may block; an older defect it newly notices is a
+  prominent non-blocking advisory, however serious. After your hand-off, only
+  your request, what it needs and defects within those corrections may block,
+  through later internal rounds, until you replace it; a cost you accepted
+  stays accepted. It checks the coder's commits against git. If the history it
+  needs is unavailable (for example before results were recorded, or pruned),
+  it refuses to approve and says exactly what is missing, which sends the task
+  to a human instead of resetting the scope. The reviewer is told the task's closes list. It checks
   the coder's work report against the code: a report claim that hides
   missing work blocks, and any other inaccuracy (such as a claim that the PR
   closes another issue) is a minor finding listed for the writer to correct.
@@ -59,8 +80,8 @@ Read this while watching a task, when its behaviour surprises you.
   own verdict. Its loop guard counts rejections in a row: the 4th in a
   row sends the task to `escalate_to_human`. An approval or escalating
   starts the count over, so your `/request-changes` always gets a fresh
-  internal budget. It re-reads the PR's comments, so it can pick up review
-  items the coder ignored.
+  internal budget. It reads the PR's comments too; only those from OWNER,
+  MEMBER or COLLABORATOR accounts that aren't bots count as instruction.
 - **describe_pr.** A read-only `writer` turn, after every approval (the first
   open and each human-review, red-CI or conflict round), that writes the PR
   description from the spec, the coder's work report, the internal reviewer's
