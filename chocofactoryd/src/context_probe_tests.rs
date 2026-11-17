@@ -1706,7 +1706,7 @@ fn the_coder_item_checks_accept_an_answer_only_for_its_own_item() {
             "a no-work answer that claims a change in one clause",
             right.replace(
                 "(F2) not done and no proof added, as you instructed.",
-                "(F2) not done earlier and changed today for good measure.",
+                "(F2) not done and changed today for good measure.",
             ),
         ),
         (
