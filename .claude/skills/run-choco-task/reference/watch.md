@@ -43,11 +43,55 @@ before the command returns, so `--until attention` can follow it directly.
 
 ## Reading a stage's verdict text
 
-The latest lap's text of `spec_check` or `internal_review`:
+The text a finished lap of `spec_check` or `internal_review` left:
 
 ```bash
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.internal_review.summary'
 ```
+
+**This is the stage's live text, and it is empty while a new lap runs.** The
+daemon removes a stage's previous text at the moment it starts a new attempt
+of that stage (running, interrupted by a usage limit, stuck): the new attempt
+has not produced a verdict yet, so `jq` prints `null` or nothing. Empty is
+neither approval nor rejection, and the previous lap's text is not the new
+lap's. Read an empty result as "no verdict from this attempt", and look at the
+task's status and `stuck_reason` for what happened to it. The one case where
+old text can still show is a turn that has not started: it is queued for a
+free agent slot or held by a pause, or it failed before launch (its prompt
+would not render, for example). That text is the previous run's, and no new
+agent has run for that pending entry.
+
+### Reading an earlier applied verdict
+
+An earlier lap's verdict is kept in the task's recorded history, not in the
+live text above. The daemon records a stage result each time a task leaves a
+stage, and `choco` has no command to read it, so ask the daemon's HTTP API.
+First find the daemon `choco` talks to (the order is in
+[docs/cli.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/cli.md#which-daemon-choco-talks-to-the-base-url)):
+
+```sh
+DAEMON=${CHOCO_BASE_URL:-http://127.0.0.1:$(jq -r .port ~/.config/chocofactory/chocofactoryd.lock)}
+ID=<complete task id>
+curl --silent --show-error --get "$DAEMON/tasks/$ID/context" \
+  --data-urlencode 'source=stage' --data-urlencode 'stage=internal_review'
+```
+
+The answer's `provenance` says what it is. `stage_result` is a recorded
+departure from that stage: its `result.result_id`, `outcome` and
+`capture.summary` are the verdict that was applied. To read exactly one result
+again by its ID (the complete ID from that answer):
+
+```sh
+curl --silent --show-error --get "$DAEMON/tasks/$ID/context" \
+  --data-urlencode 'source=stage' --data-urlencode "result_id=$RESULT_ID"
+```
+
+`snapshot` is a legacy answer for a task from before results were recorded: it
+is the stage's live text, so it is gone once the stage has started a new
+attempt. `unavailable` names a limitation (`reason`), such as pruned or
+never-recorded history; it does not say the stage never ran or approved.
+History is pruned with the other events and not back-filled, so an old task may
+have none. See [docs/context.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/context.md).
 
 The coder's stages keep their report too. Its latest one is `revising`'s if that
 stage has run and `coding`'s otherwise; when the task is parked at `blocker`,
@@ -58,11 +102,14 @@ choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revisi
 ```
 
 `scripts/tail-events.sh` cuts each event to one line, so it can't show
-reasons. Every lap's text is in the events. A report is a `tool_call` event
+reasons. Every report an agent made is in the events, applied or not. A report is a `tool_call` event
 whose `payload.tool` ends in `report_outcome`, with `payload.input.outcome`
 and `payload.input.summary`. (A `get_context` call is a `tool_call` too, with
 `payload.tool` ending in `get_context`: a read of the task's recorded history,
-never a report, so it is not in this list.) Events come oldest first, 100 a page by default
+never a report, so it is not in this list.) A report in this list is what the
+agent said, not proof that it was applied: a turn interrupted after its report
+was accepted but before the turn ended applies nothing. The applied ones are the
+`stage_result` events (see [above](#reading-an-earlier-applied-verdict)). Events come oldest first, 100 a page by default
 and at most 500 with `--limit 500`; `next_token` (pass it to `--after`) is
 null on the last page. This loop prints every report:
 

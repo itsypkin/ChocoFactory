@@ -304,16 +304,20 @@ choco task create --project <p> --workflow coding-task-planned \
   [reference/watch.md](reference/watch.md#waiting-with---until); typical
   stage times for choosing `--timeout` are in
   [reference/watch.md](reference/watch.md#stage-times).
-- **Read a stage's verdict text** (the latest lap) with
+- **Read a stage's verdict text** with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
-  for `spec_check` or `internal_review`. For the coder's latest report, which
+  for `spec_check` or `internal_review`. It is empty while a new lap of that
+  stage runs or is stuck, and empty is neither approval nor rejection; an
+  earlier lap's applied verdict is read from the task's recorded history
+  (see [reference/watch.md](reference/watch.md#reading-an-earlier-applied-verdict)).
+  For the coder's latest report, which
   holds the reason when it stopped at `blocker`, use
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`.
   The description the writer wrote is `.workflow_state.payload.stages.describe_pr.summary`.
   While the task is open, the coder's work report (what the reviewer checks
   and the writer reads) is in the worktree's private git directory, never
   committed: `cat "$(git -C <worktree> rev-parse --git-dir)/choco-work-report.md"`.
-  Every lap's text, and watching
+  Every report, and watching
   commits while a revise lap is still open, are in
   [reference/watch.md](reference/watch.md#reading-a-stages-verdict-text).
 - **Find the task's PR** with `gh pr list --head task/<task-id>` (add

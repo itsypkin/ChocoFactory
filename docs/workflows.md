@@ -928,6 +928,14 @@ left_at.<branch> }}` is not supported (`…but '{referenced}' is not a stage in
 this workflow`); `left_at.<group>` works. A later stage can read a branch
 only if the branch has `capture:`.
 
+A branch's previous capture is removed from the task's live state when its
+attempt launches, after the prompt has been rendered, so it is never shown as
+the new attempt's result. A stage entry's first rendered-and-delivered prompt
+can include its own earlier summary, but after the capture is cleared, a later
+fresh re-render (`choco task retry --fresh`, or recovery after a crash before
+the prompt was delivered) may lack that text; a supported resume keeps the
+session's existing transcript.
+
 ### What it costs
 
 There is no cap on the number of branches. Unless an agent cap is set (see
