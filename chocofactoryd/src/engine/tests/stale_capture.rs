@@ -930,6 +930,9 @@ async fn a_launch_dropped_while_clearing_commits_nothing_and_the_next_one_starts
     // sees the state exactly as it was, no session, no result.
     sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
     drop(writer);
+    // Long enough for a write that outlived the launch to land (SQLite's
+    // busy handler retries within a few tens of milliseconds).
+    tokio::time::sleep(StdDuration::from_millis(700)).await;
     assert_eq!(untouched(&observer, &task_id).await, before);
     assert_eq!(
         engine.running_total(),
