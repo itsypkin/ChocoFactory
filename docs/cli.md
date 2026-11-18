@@ -195,7 +195,8 @@ prefix of at least 8 characters (the first 8 characters of a full id). The prefi
 literally and case-sensitively against every task's id, whatever its project or
 status. If it matches several tasks, `choco` fails listing every matching id and
 does nothing; a prefix that matches none, or one shorter than 8 characters, fails
-with `no such task`. Task ids `choco` prints stay full ids. This is `choco` looking the
+with `no such task`. The task commands' own output (`status`, `events` and the rest) still
+prints full ids; the dashboard's id column shows the first 8 characters. This is `choco` looking the
 id up in the task list; the daemon's HTTP API still takes full ids only.
 
 Check where it is. `Progress` shows the stages the task has passed
