@@ -1323,7 +1323,7 @@ async fn task_create_rejects_a_malformed_role_flag_without_creating_a_task() {
 async fn task_reconfigure_without_any_overrides_is_an_error() {
     let daemon = Daemon::spawn(TempHome::new()).await;
 
-    let failed = run_choco(&daemon.base_url, &["task", "reconfigure", "some-task"]).await;
+    let failed = run_choco(&daemon.base_url, &["task", "reconfigure", FAKE_WATCH_ID]).await;
     assert_eq!(failed.code, Some(1), "stdout: {}", failed.stdout);
     assert!(
         failed.stderr.contains("nothing to change"),
@@ -2321,7 +2321,7 @@ async fn watch_first_poll_errors_are_fatal() {
         &[
             "task",
             "status",
-            "x",
+            FAKE_WATCH_ID,
             "--until",
             "closed",
             "--interval",
@@ -2338,7 +2338,7 @@ async fn watch_first_poll_errors_are_fatal() {
     );
 
     let d = Daemon::spawn(TempHome::new()).await;
-    let out = watch_choco(&d, "does-not-exist", &["--until", "closed"]).await;
+    let out = watch_choco(&d, FAKE_WATCH_ID, &["--until", "closed"]).await;
     assert_eq!(out.code, Some(1));
     assert!(out.stderr.starts_with("error: "), "{}", out.stderr);
     assert!(
@@ -2369,6 +2369,11 @@ async fn watch_flag_misuse_is_a_usage_error() {
         assert_eq!(out.code, Some(2), "{extra:?}: {}", out.stderr);
     }
 }
+
+/// A full-length task id no daemon here knows: the tests that exercise the
+/// watcher's own transport/decode/timeout behaviour need an id that skips
+/// prefix resolution (short ids are looked up in the task list first).
+const FAKE_WATCH_ID: &str = "a1b2c3d4-0000-4000-8000-000000000001";
 
 /// One scripted reply of the fake daemon.
 #[derive(Clone, Copy)]
@@ -2407,7 +2412,7 @@ async fn fake_daemon(script: Vec<Reply>) -> String {
                 Reply::NotFound => ("404 Not Found", r#"{"error":"no such task"}"#),
                 Reply::Open => (
                     "200 OK",
-                    r#"{"id":"t1","status":"open","workflow_state":{"current_stage":"wait"},"stage_trail":[]}"#,
+                    r#"{"id":"a1b2c3d4-0000-4000-8000-000000000001","status":"open","workflow_state":{"current_stage":"wait"},"stage_trail":[]}"#,
                 ),
             };
             let resp = format!(
@@ -2428,7 +2433,7 @@ async fn watch_rides_out_connection_failures_and_resets_the_count() {
     let started = std::time::Instant::now();
     let child = spawn_watcher(
         &base,
-        "t1",
+        FAKE_WATCH_ID,
         &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
     );
     let (code, stderr) = finish_watcher(child).await;
@@ -2444,7 +2449,7 @@ async fn watch_gives_up_after_exactly_three_consecutive_connection_failures() {
     let base = fake_daemon(vec![Open, Drop, Drop, Drop]).await;
     let child = spawn_watcher(
         &base,
-        "t1",
+        FAKE_WATCH_ID,
         &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
     );
     let (code, stderr) = finish_watcher(child).await;
@@ -2461,7 +2466,7 @@ async fn watch_mid_watch_decode_error_is_fatal_at_once() {
     let base = fake_daemon(vec![Open, NotATask]).await;
     let child = spawn_watcher(
         &base,
-        "t1",
+        FAKE_WATCH_ID,
         &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
     );
     let (code, stderr) = finish_watcher(child).await;
@@ -2473,7 +2478,11 @@ async fn watch_mid_watch_decode_error_is_fatal_at_once() {
 async fn watch_mid_watch_api_error_is_fatal_at_once() {
     use Reply::{NotFound, Open};
     let base = fake_daemon(vec![Open, NotFound]).await;
-    let child = spawn_watcher(&base, "t1", &["--until", "closed", "--interval", "1s"]);
+    let child = spawn_watcher(
+        &base,
+        FAKE_WATCH_ID,
+        &["--until", "closed", "--interval", "1s"],
+    );
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(1), "stderr: {stderr}");
     assert!(stderr.contains("no such task"), "{stderr}");
@@ -2485,7 +2494,7 @@ async fn watch_timeout_bounds_a_poll_that_never_answers() {
     let base = fake_daemon(vec![Open, Hang]).await;
     let child = spawn_watcher(
         &base,
-        "t1",
+        FAKE_WATCH_ID,
         &["--until", "closed", "--interval", "1s", "--timeout", "3s"],
     );
     let (code, stderr) = finish_watcher(child).await;
@@ -2514,7 +2523,7 @@ async fn watch_timeout_bounds_a_first_poll_that_never_answers() {
     let base = fake_daemon(vec![Reply::Hang]).await;
     let child = spawn_watcher(
         &base,
-        "t1",
+        FAKE_WATCH_ID,
         &["--until", "closed", "--interval", "1s", "--timeout", "3s"],
     );
     let (code, stderr) = finish_watcher(child).await;
@@ -3527,4 +3536,1351 @@ async fn task_send_and_cancel_print_nothing_anywhere_under_json() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+// ---- Short task ids (#378) ----
+//
+// A recorded-target fake daemon: `GET /tasks` serves a fixed, deliberately
+// mixed list; every target route answers from its own stored task, never
+// from the id in the request, and every request and effect is recorded, so
+// a test can tell which task a command reached.
+
+use axum::body::Body;
+use axum::http::{HeaderValue, Request, Response, StatusCode};
+
+/// Two tasks sharing the 8-byte prefix `8347d1b2`, in different projects and
+/// states, and an unrelated one.
+const ID_A: &str = "8347d1b2-fa0f-4474-9c3f-36e6a6904331";
+const ID_B: &str = "8347d1b2-beef-4474-9c3f-36e6a6904332";
+const ID_C: &str = "9a47d1b2-fa0f-4474-9c3f-36e6a6904333";
+/// Shares only seven bytes (`8347d1b`) with A and B.
+const ID_NEAR: &str = "8347d1b3-fa0f-4474-9c3f-36e6a6904334";
+
+const LIST_SENTINEL: &str = "sentinel: the task list is unavailable (test-injected)";
+const REFUSAL_SENTINEL: &str = "sentinel refusal: this task cannot do that now (test-injected)";
+
+#[derive(Clone)]
+struct FxTask {
+    id: String,
+    project: &'static str,
+    status: &'static str,
+    title: String,
+}
+
+impl FxTask {
+    fn new(id: &str, project: &'static str, status: &'static str) -> Self {
+        FxTask {
+            id: id.to_string(),
+            project,
+            status,
+            title: format!("title of {id}"),
+        }
+    }
+
+    fn stage(&self) -> String {
+        format!("stage-of-{}", self.id)
+    }
+
+    /// The task row alone, as `PATCH /tasks/{id}` returns it.
+    fn row(&self) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "project_id": self.project,
+            "workflow_def": "wf",
+            "title": self.title,
+            "status": self.status,
+            "config": {},
+            "worktree_repo": null,
+            "worktree_project": null,
+            "stuck_reason": null,
+            "paused_at": null,
+            "kept_work": false,
+            "workflow_path": null,
+            "workflow_sha256": null,
+            "base_ref": null,
+            "base_commit": null,
+            "closes": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    /// The row as `GET /tasks` lists it.
+    fn summary(&self) -> Value {
+        let mut row = self.row();
+        row["current_stage"] = self.stage().into();
+        row["stage_entered_at"] = Value::Null;
+        row["loop_counters"] = serde_json::json!({});
+        row["pr"] = Value::Null;
+        row
+    }
+
+    /// What `GET /tasks/{id}` serves; `status` is passed in because a watch
+    /// test changes it while the task runs.
+    fn detail(&self, status: &str) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "project_id": self.project,
+            "title": self.title,
+            "status": status,
+            "stuck_reason": null,
+            "workflow_state": { "current_stage": self.stage() },
+            "stage_trail": [],
+        })
+    }
+}
+
+fn fx_event(id: &str, task_id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "task_id": task_id,
+        "session_id": null,
+        "event_type": "human_message",
+        "payload": { "text": text },
+        "created_at": "2026-01-02T03:04:05Z",
+    })
+}
+
+#[derive(Clone)]
+enum FxList {
+    /// The whole stored list.
+    All,
+    /// A 500 with `{"error": LIST_SENTINEL}`.
+    Api,
+    /// A 200 with this exact body.
+    Body(String),
+    /// Record the request, then never answer.
+    Hold,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FxReq {
+    method: String,
+    target: String,
+    body: String,
+}
+
+struct FxInner {
+    tasks: Vec<FxTask>,
+    events: Vec<Value>,
+    list: FxList,
+    /// Every mutation answers 409 `REFUSAL_SENTINEL`.
+    refuse: bool,
+    /// Task detail reads `closed` instead of `open` once set.
+    released: bool,
+    /// Status the detail reports until `released`; `None` uses the stored one.
+    held_status: Option<&'static str>,
+    /// Exact target paths that answer 409 with this message.
+    target_errors: Vec<(String, String)>,
+    requests: Vec<FxReq>,
+    /// `(task id, verb)` for each mutation that was accepted.
+    effects: Vec<(String, String)>,
+    /// Set when a held list request's handler was dropped (client went away).
+    hold_dropped: bool,
+}
+
+struct FxServer {
+    base_url: String,
+    inner: std::sync::Arc<std::sync::Mutex<FxInner>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FxServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Flags the shared state when the request handler holding a list response
+/// is dropped, i.e. when hyper noticed the client was gone.
+struct HoldGuard(std::sync::Arc<std::sync::Mutex<FxInner>>);
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().hold_dropped = true;
+    }
+}
+
+fn fx_response(status: u16, body: Option<&Value>) -> Response<Body> {
+    let mut resp = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap())
+        .header(
+            "x-chocofactory-version",
+            chocofactory_core::version::VERSION,
+        );
+    let body = match body {
+        Some(v) => {
+            resp = resp.header("content-type", HeaderValue::from_static("application/json"));
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    resp.body(body).unwrap()
+}
+
+fn fx_error(status: u16, message: &str) -> Response<Body> {
+    fx_response(status, Some(&serde_json::json!({ "error": message })))
+}
+
+async fn fx_handle(
+    inner: std::sync::Arc<std::sync::Mutex<FxInner>>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let method = req.method().to_string();
+    let target = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let resp = fx_dispatch(&inner, method, target, body);
+    if resp.headers().contains_key("x-fx-hold") {
+        // The held list request: never answered. The guard records when
+        // hyper drops this handler because the client went away.
+        let _held = HoldGuard(inner.clone());
+        std::future::pending::<()>().await;
+    }
+    resp
+}
+
+/// The synchronous part of the fake daemon; a response carrying `x-fx-hold`
+/// means "hold this request open without answering".
+fn fx_dispatch(
+    inner: &std::sync::Arc<std::sync::Mutex<FxInner>>,
+    method: String,
+    target: String,
+    body: String,
+) -> Response<Body> {
+    let path = target.split('?').next().unwrap().to_string();
+    let query = target.split_once('?').map(|(_, q)| q.to_string());
+
+    let mut guard = inner.lock().unwrap();
+    guard.requests.push(FxReq {
+        method: method.clone(),
+        target: target.clone(),
+        body: body.clone(),
+    });
+
+    if method == "GET" && path == "/tasks" {
+        // A prefix lookup must ask for the whole list: any filter, limit or
+        // order would hide rows from it.
+        if query.is_some() {
+            return fx_error(400, "the list must be requested without any query");
+        }
+        return match guard.list.clone() {
+            FxList::All => {
+                let rows: Vec<Value> = guard.tasks.iter().map(FxTask::summary).collect();
+                fx_response(200, Some(&Value::Array(rows)))
+            }
+            FxList::Api => fx_error(500, LIST_SENTINEL),
+            FxList::Body(text) => Response::builder()
+                .status(200)
+                .header(
+                    "x-chocofactory-version",
+                    chocofactory_core::version::VERSION,
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(text))
+                .unwrap(),
+            FxList::Hold => Response::builder()
+                .header("x-fx-hold", "1")
+                .body(Body::empty())
+                .unwrap(),
+        };
+    }
+
+    let Some(rest) = path.strip_prefix("/tasks/") else {
+        return fx_error(404, "no such route");
+    };
+    let (id, verb) = match rest.split_once('/') {
+        Some((id, verb)) => (id, verb),
+        None => (rest, ""),
+    };
+    if let Some((_, message)) = guard.target_errors.iter().find(|(p, _)| *p == path) {
+        return fx_error(409, message);
+    }
+    let Some(task) = guard.tasks.iter().find(|t| t.id == id).cloned() else {
+        return fx_error(404, &format!("no such task '{id}'"));
+    };
+    let json_body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+
+    match (method.as_str(), verb) {
+        ("GET", "") => {
+            let status = match (guard.released, guard.held_status) {
+                (false, Some(held)) => held,
+                _ if guard.released => "closed",
+                _ => task.status,
+            };
+            fx_response(200, Some(&task.detail(status)))
+        }
+        ("GET", "events") => {
+            let all: Vec<Value> = guard
+                .events
+                .iter()
+                .filter(|e| e["task_id"] == task.id.as_str())
+                .cloned()
+                .collect();
+            let q = query.unwrap_or_default();
+            let param = |name: &str| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                    .map(str::to_string)
+            };
+            let start = param("after")
+                .map(|t| t.strip_prefix("tok-").unwrap().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            let limit = param("limit")
+                .map(|l| l.parse::<usize>().unwrap())
+                .unwrap_or(100);
+            let end = (start + limit).min(all.len());
+            let next = (end < all.len()).then(|| format!("tok-{end}"));
+            fx_response(
+                200,
+                Some(&serde_json::json!({ "events": all[start..end], "next_token": next })),
+            )
+        }
+        ("POST" | "PATCH", verb)
+            if matches!(
+                verb,
+                "messages" | "cancel" | "retry" | "pause" | "resume" | ""
+            ) =>
+        {
+            if guard.refuse {
+                return fx_error(409, REFUSAL_SENTINEL);
+            }
+            let verb = if verb.is_empty() { "config" } else { verb };
+            guard.effects.push((task.id.clone(), verb.to_string()));
+            match verb {
+                "messages" | "cancel" => fx_response(202, None),
+                "retry" => fx_response(
+                    202,
+                    Some(&serde_json::json!({
+                        "stage": task.stage(),
+                        "resumed": json_body["mode"] == "resume",
+                        "adapter_session_id": null,
+                        "fresh_reason": null,
+                    })),
+                ),
+                "pause" => fx_response(
+                    202,
+                    Some(&serde_json::json!({
+                        "status": "pausing",
+                        "mode": if json_body["now"] == true { "now" } else { "graceful" },
+                        "stage": task.stage(),
+                        "running": 1,
+                        "stop_failures": [],
+                    })),
+                ),
+                "resume" => fx_response(
+                    202,
+                    Some(&serde_json::json!({
+                        "stage": task.stage(),
+                        "started": [task.stage()],
+                        "resumed": [],
+                    })),
+                ),
+                _ => {
+                    let mut row = task.row();
+                    row["config"] = json_body["config"].clone();
+                    fx_response(200, Some(&row))
+                }
+            }
+        }
+        _ => fx_error(404, "no such route"),
+    }
+}
+
+impl FxServer {
+    async fn start(tasks: Vec<FxTask>, events: Vec<Value>) -> FxServer {
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(FxInner {
+            tasks,
+            events,
+            list: FxList::All,
+            refuse: false,
+            released: false,
+            held_status: None,
+            target_errors: Vec::new(),
+            requests: Vec::new(),
+            effects: Vec::new(),
+            hold_dropped: false,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let shared = inner.clone();
+        let app = axum::Router::new().fallback(move |req: Request<Body>| {
+            let shared = shared.clone();
+            async move { fx_handle(shared, req).await }
+        });
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        FxServer {
+            base_url,
+            inner,
+            handle,
+        }
+    }
+
+    fn set(&self, f: impl FnOnce(&mut FxInner)) {
+        f(&mut self.inner.lock().unwrap());
+    }
+
+    /// Requests recorded since the last call, as `"METHOD target"`.
+    fn take_requests(&self) -> Vec<FxReq> {
+        std::mem::take(&mut self.inner.lock().unwrap().requests)
+    }
+
+    fn lines(reqs: &[FxReq]) -> Vec<String> {
+        reqs.iter()
+            .map(|r| format!("{} {}", r.method, r.target))
+            .collect()
+    }
+
+    fn effects(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().effects.clone()
+    }
+}
+
+/// Eight tasks with distinct 8-byte prefixes and distinct states, projects,
+/// titles and events, plus the A/B/NEAR/C set; the selected task of each
+/// lookup has unrelated rows on both sides of it in the list.
+fn fx_mixed_tasks() -> Vec<FxTask> {
+    vec![
+        FxTask::new(ID_C, "p3", "open"),
+        FxTask::new("0aaaaaa1-1111-4222-8333-000000000001", "p1", "open"),
+        FxTask::new("0aaaaaa2-1111-4222-8333-000000000002", "p1", "pausing"),
+        FxTask::new("0aaaaaa3-1111-4222-8333-000000000003", "p2", "paused"),
+        FxTask::new(ID_A, "p1", "open"),
+        FxTask::new("0aaaaaa4-1111-4222-8333-000000000004", "p2", "stuck"),
+        FxTask::new("0aaaaaa5-1111-4222-8333-000000000005", "p1", "closed"),
+        FxTask::new(ID_B, "p2", "closed"),
+        FxTask::new("0aaaaaa6-1111-4222-8333-000000000006", "p3", "cancelled"),
+        FxTask::new(ID_NEAR, "p3", "open"),
+    ]
+}
+
+fn fx_events_for(tasks: &[FxTask]) -> Vec<Value> {
+    tasks
+        .iter()
+        .flat_map(|t| {
+            [
+                fx_event(
+                    &format!("ev1-{}", t.id),
+                    &t.id,
+                    &format!("first of {}", t.id),
+                ),
+                fx_event(
+                    &format!("ev2-{}", t.id),
+                    &t.id,
+                    &format!("second of {}", t.id),
+                ),
+            ]
+        })
+        .collect()
+}
+
+async fn fx_start_mixed() -> FxServer {
+    let tasks = fx_mixed_tasks();
+    let events = fx_events_for(&tasks);
+    FxServer::start(tasks, events).await
+}
+
+fn fx_task(server: &FxServer, id: &str) -> FxTask {
+    server
+        .inner
+        .lock()
+        .unwrap()
+        .tasks
+        .iter()
+        .find(|t| t.id == id)
+        .unwrap()
+        .clone()
+}
+
+fn fx_expected_events(server: &FxServer, id: &str) -> Vec<Value> {
+    server
+        .inner
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter(|e| e["task_id"] == id)
+        .cloned()
+        .collect()
+}
+
+/// A unique 8-byte prefix, a longer hyphen-bearing one and a 35-byte one
+/// each select the stored task, in every lifecycle state, and `status` and
+/// `events` report that task's own record. Each lookup is one unfiltered
+/// `GET /tasks` and then one request on the full id.
+#[tokio::test]
+async fn task_prefix_status_and_events() {
+    let server = fx_start_mixed().await;
+    let selected: Vec<(String, &str)> = fx_mixed_tasks()
+        .into_iter()
+        .map(|t| (t.id.clone(), t.status))
+        .collect();
+    let mut states: Vec<&str> = selected.iter().map(|(_, s)| *s).collect();
+    states.sort();
+    states.dedup();
+    assert_eq!(
+        states,
+        ["cancelled", "closed", "open", "paused", "pausing", "stuck"],
+        "every lifecycle state is looked up"
+    );
+
+    for (full, status) in &selected {
+        let task = fx_task(&server, full);
+        let expected_detail = task.detail(status);
+        let expected_events = fx_expected_events(&server, full);
+        // B shares its 8 bytes with A, so it is selected by its longer prefix.
+        let prefixes: Vec<&str> = if full == ID_B || full == ID_A {
+            vec![&full[..13], &full[..35]]
+        } else {
+            vec![&full[..8], &full[..13], &full[..35]]
+        };
+        for prefix in prefixes {
+            let out = run_choco_json(&server.base_url, &["task", "status", prefix]).await;
+            assert_eq!(out.code, Some(0), "{prefix}: {}", out.stderr);
+            assert_eq!(out.json(), expected_detail, "status {prefix}");
+            assert_eq!(
+                FxServer::lines(&server.take_requests()),
+                vec!["GET /tasks".to_string(), format!("GET /tasks/{full}")],
+                "status {prefix}"
+            );
+
+            let out = run_choco_json(&server.base_url, &["task", "events", prefix]).await;
+            assert_eq!(out.code, Some(0), "{prefix}: {}", out.stderr);
+            assert_eq!(
+                out.json(),
+                serde_json::json!({ "events": expected_events, "next_token": null }),
+                "events {prefix}"
+            );
+            assert_eq!(
+                FxServer::lines(&server.take_requests()),
+                vec![
+                    "GET /tasks".to_string(),
+                    format!("GET /tasks/{full}/events")
+                ],
+                "events {prefix}"
+            );
+        }
+    }
+
+    // Matching is literal and case-sensitive over ids only: an uppercase
+    // form of a real prefix, and a prefix that only a title starts with, are
+    // refused without touching a task.
+    server.set(|s| {
+        s.tasks.push(FxTask {
+            title: "feedbeef-title-only".to_string(),
+            ..FxTask::new("0aaaaaa7-1111-4222-8333-000000000007", "p1", "open")
+        });
+        s.tasks.push(FxTask::new(
+            "abcdef01-1111-4222-8333-000000000008",
+            "p1",
+            "open",
+        ));
+        // Holds `abcdef01` mid-id, so it is no match for that prefix.
+        s.tasks.push(FxTask::new(
+            "00000000-4222-4333-8333-0000abcdef01",
+            "p1",
+            "open",
+        ));
+    });
+    let out = run_choco_json(&server.base_url, &["task", "status", "abcdef01"]).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(out.json()["id"], "abcdef01-1111-4222-8333-000000000008");
+    server.take_requests();
+    for refused in ["ABCDEF01", "feedbeef"] {
+        let out = run_choco_json(&server.base_url, &["task", "status", refused]).await;
+        assert_eq!(out.code, Some(1), "{refused}");
+        assert_eq!(out.stderr, format!("error: no such task '{refused}'\n"));
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            FxServer::lines(&server.take_requests()),
+            vec!["GET /tasks".to_string()],
+            "{refused}"
+        );
+    }
+}
+
+/// The argument vectors that carry a task id and valid options for each of
+/// the eight commands, with `{}` standing for the id.
+fn fx_commands() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["task", "status", "{}"],
+        vec!["task", "status", "{}", "--until", "closed"],
+        vec!["task", "events", "{}", "--limit", "1"],
+        vec!["task", "send", "{}", "--text", "hello"],
+        vec!["task", "cancel", "{}"],
+        vec!["task", "retry", "{}"],
+        vec!["task", "pause", "{}"],
+        vec!["task", "resume", "{}"],
+        vec!["task", "reconfigure", "{}", "--role-model", "coder=opus"],
+    ]
+}
+
+fn fx_fill(template: &[&str], id: &str) -> Vec<String> {
+    template
+        .iter()
+        .map(|a| {
+            if *a == "{}" {
+                id.to_string()
+            } else {
+                a.to_string()
+            }
+        })
+        .collect()
+}
+
+async fn fx_run(server: &FxServer, args: &[String]) -> ChocoOutput {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_choco_json(&server.base_url, &refs).await
+}
+
+/// A prefix that matches several tasks stops every command before any
+/// request on a target: it lists every match, sorted, and nothing else.
+/// Three sets, so no single filter explains a pass: matches that differ in
+/// state only, matches that differ in project only, and both at once.
+#[tokio::test]
+async fn task_prefix_ambiguity() {
+    let mut tasks = fx_mixed_tasks();
+    // Larger id first, so sorting is observable.
+    tasks.push(FxTask::new(
+        "5ee7a000-bbbb-4222-8333-000000000002",
+        "p1",
+        "closed",
+    ));
+    tasks.push(FxTask::new(
+        "5ee7a000-aaaa-4222-8333-000000000001",
+        "p1",
+        "open",
+    ));
+    tasks.push(FxTask::new(
+        "c0ffee11-bbbb-4222-8333-000000000004",
+        "p2",
+        "open",
+    ));
+    tasks.push(FxTask::new(
+        "c0ffee11-aaaa-4222-8333-000000000003",
+        "p1",
+        "open",
+    ));
+    // Unrelated tasks that must not be listed: a seven-byte near miss.
+    tasks.push(FxTask::new(
+        "c0ffee12-aaaa-4222-8333-000000000005",
+        "p1",
+        "open",
+    ));
+    let events = fx_events_for(&tasks);
+    let server = FxServer::start(tasks, events).await;
+
+    let cases: [(&str, Vec<&str>); 3] = [
+        // state differs, project the same
+        (
+            "5ee7a000",
+            vec![
+                "5ee7a000-aaaa-4222-8333-000000000001",
+                "5ee7a000-bbbb-4222-8333-000000000002",
+            ],
+        ),
+        // project differs, state the same
+        (
+            "c0ffee11",
+            vec![
+                "c0ffee11-aaaa-4222-8333-000000000003",
+                "c0ffee11-bbbb-4222-8333-000000000004",
+            ],
+        ),
+        // both differ: the reported case
+        ("8347d1b2", vec![ID_B, ID_A]),
+    ];
+    for (prefix, mut expected) in cases {
+        expected.sort();
+        for template in fx_commands() {
+            let args = fx_fill(&template, prefix);
+            let out = fx_run(&server, &args).await;
+            let why = format!("{args:?}");
+            assert_eq!(out.code, Some(1), "{why}: {}", out.stderr);
+            assert_eq!(out.stdout, "", "{why}");
+            assert_eq!(
+                out.stderr,
+                format!("error: ambiguous id '{prefix}': {}\n", expected.join(", ")),
+                "{why}"
+            );
+            assert_eq!(
+                FxServer::lines(&server.take_requests()),
+                vec!["GET /tasks".to_string()],
+                "{why}"
+            );
+        }
+    }
+    assert_eq!(server.effects(), vec![], "no command reached a task");
+}
+
+/// Input too short to be a prefix, or a prefix nothing starts with, is a
+/// no-such-task refusal; a seven-byte prefix does not resolve even though
+/// exactly one task starts with it.
+#[tokio::test]
+async fn task_prefix_too_short_and_unknown() {
+    let server = fx_start_mixed().await;
+    // Exactly one task starts with these seven bytes.
+    let seven = &ID_C[..7];
+    assert_eq!(
+        fx_mixed_tasks()
+            .iter()
+            .filter(|t| t.id.starts_with(seven))
+            .count(),
+        1
+    );
+
+    for (input, lists) in [(seven, 0), ("", 0), ("deadbeef", 1)] {
+        // Mutations as well as reads: a refusal must not fall through to a task.
+        for template in [
+            vec!["task", "status", "{}"],
+            vec!["task", "cancel", "{}"],
+            vec!["task", "send", "{}", "--text", "hi"],
+        ] {
+            let args = fx_fill(&template, input);
+            let out = fx_run(&server, &args).await;
+            let why = format!("{args:?}");
+            assert_eq!(out.code, Some(1), "{why}: {}", out.stderr);
+            assert_eq!(out.stdout, "", "{why}");
+            assert_eq!(
+                out.stderr,
+                format!("error: no such task '{input}'\n"),
+                "{why}"
+            );
+            assert_eq!(
+                FxServer::lines(&server.take_requests()),
+                vec!["GET /tasks".to_string(); lists],
+                "{why}"
+            );
+        }
+    }
+    assert_eq!(server.effects(), vec![]);
+
+    // An unknown full id goes to its own endpoint, which reports it.
+    let unknown = "11111111-2222-4333-8444-555555555555";
+    let out = run_choco_json(&server.base_url, &["task", "status", unknown]).await;
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stderr, format!("error: no such task '{unknown}'\n"));
+    assert_eq!(
+        FxServer::lines(&server.take_requests()),
+        vec![format!("GET /tasks/{unknown}")]
+    );
+
+    // A missing id is clap's usage error, before any network use.
+    let out = run_choco_json(&server.base_url, &["task", "status"]).await;
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("<ID>"), "{}", out.stderr);
+    assert_eq!(server.take_requests(), vec![]);
+}
+
+/// An id of 36 bytes or more is sent as it is, to its own endpoint: no list
+/// request, no UUID validation and no truncation.
+#[tokio::test]
+async fn task_prefix_full_ids_bypass_list() {
+    let server = fx_start_mixed().await;
+    server.set(|s| s.list = FxList::Api);
+
+    let task = fx_task(&server, ID_C);
+    let out = run_choco_json(&server.base_url, &["task", "status", ID_C]).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(out.json(), task.detail("open"));
+    assert_eq!(
+        FxServer::lines(&server.take_requests()),
+        vec![format!("GET /tasks/{ID_C}")]
+    );
+
+    let thirty_six = "z".repeat(36);
+    let longer = format!("not-a-uuid-{}", "Z".repeat(40));
+    assert_eq!(thirty_six.len(), 36);
+    for id in [thirty_six, longer] {
+        server.set(|s| {
+            s.target_errors
+                .push((format!("/tasks/{id}"), format!("distinct error for {id}")));
+        });
+        let out = run_choco_json(&server.base_url, &["task", "status", &id]).await;
+        assert_eq!(out.code, Some(1));
+        assert_eq!(out.stderr, format!("error: distinct error for {id}\n"));
+        assert_eq!(
+            FxServer::lines(&server.take_requests()),
+            vec![format!("GET /tasks/{id}")]
+        );
+    }
+}
+
+/// Every id-bearing command reaches the selected task's own endpoint with
+/// its flags and body intact, reads follow-up data from the same id, and a
+/// daemon refusal after a successful lookup stays a refusal.
+#[tokio::test]
+async fn task_prefix_routes_all_commands() {
+    let server = fx_start_mixed().await;
+    let a = fx_task(&server, ID_A);
+    // Unique among the set: it spells the A id only up to the second group.
+    let prefix = &ID_A[..12];
+    assert!(
+        fx_mixed_tasks()
+            .iter()
+            .filter(|t| t.id.starts_with(prefix))
+            .count()
+            == 1
+    );
+
+    struct Route {
+        args: Vec<&'static str>,
+        requests: Vec<(&'static str, String, &'static str)>,
+        stdout: Option<Value>,
+        effect: Option<&'static str>,
+    }
+    let stage = a.stage();
+    let cfg = serde_json::json!({ "roles": { "coder": { "model": "opus" } } });
+    let mut reconfigured = a.row();
+    reconfigured["config"] = cfg.clone();
+    let t = |p: &str| format!("/tasks/{ID_A}{p}");
+    let routes = vec![
+        Route {
+            args: vec!["task", "status", "{}"],
+            requests: vec![("GET", t(""), "")],
+            stdout: Some(a.detail("open")),
+            effect: None,
+        },
+        Route {
+            args: vec!["task", "events", "{}", "--limit", "1", "--after", "tok-1"],
+            requests: vec![("GET", t("/events?limit=1&after=tok-1"), "")],
+            stdout: Some(serde_json::json!({
+                "events": [fx_expected_events(&server, ID_A)[1].clone()],
+                "next_token": null
+            })),
+            effect: None,
+        },
+        Route {
+            args: vec![
+                "task",
+                "send",
+                "{}",
+                "--text",
+                "line one\nline two /approve",
+            ],
+            requests: vec![
+                (
+                    "POST",
+                    t("/messages"),
+                    r#"{"text":"line one\nline two /approve"}"#,
+                ),
+                // `send` reads the task afterwards to report where it is.
+                ("GET", t(""), ""),
+            ],
+            stdout: None,
+            effect: Some("messages"),
+        },
+        Route {
+            args: vec!["task", "cancel", "{}"],
+            requests: vec![("POST", t("/cancel"), r#"{"keep":false}"#)],
+            stdout: None,
+            effect: Some("cancel"),
+        },
+        Route {
+            args: vec!["task", "cancel", "{}", "--keep"],
+            requests: vec![
+                ("POST", t("/cancel"), r#"{"keep":true}"#),
+                // `--keep` reads the task afterwards to name its worktree.
+                ("GET", t(""), ""),
+            ],
+            stdout: None,
+            effect: Some("cancel"),
+        },
+        Route {
+            args: vec!["task", "retry", "{}"],
+            requests: vec![("POST", t("/retry"), r#"{"mode":"auto"}"#)],
+            stdout: Some(
+                serde_json::json!({"stage": stage, "resumed": false, "adapter_session_id": null, "fresh_reason": null, "rewatched": false, "branches": [], "queued": null}),
+            ),
+            effect: Some("retry"),
+        },
+        Route {
+            args: vec!["task", "retry", "{}", "--fresh"],
+            requests: vec![("POST", t("/retry"), r#"{"mode":"fresh"}"#)],
+            stdout: Some(
+                serde_json::json!({"stage": stage, "resumed": false, "adapter_session_id": null, "fresh_reason": null, "rewatched": false, "branches": [], "queued": null}),
+            ),
+            effect: Some("retry"),
+        },
+        Route {
+            args: vec!["task", "retry", "{}", "--resume"],
+            requests: vec![("POST", t("/retry"), r#"{"mode":"resume"}"#)],
+            stdout: Some(
+                serde_json::json!({"stage": stage, "resumed": true, "adapter_session_id": null, "fresh_reason": null, "rewatched": false, "branches": [], "queued": null}),
+            ),
+            effect: Some("retry"),
+        },
+        Route {
+            args: vec!["task", "pause", "{}"],
+            requests: vec![("POST", t("/pause"), r#"{"now":false}"#)],
+            stdout: Some(
+                serde_json::json!({"status": "pausing", "mode": "graceful", "stage": stage, "running": 1, "stop_failures": []}),
+            ),
+            effect: Some("pause"),
+        },
+        Route {
+            args: vec!["task", "pause", "{}", "--now"],
+            requests: vec![("POST", t("/pause"), r#"{"now":true}"#)],
+            stdout: Some(
+                serde_json::json!({"status": "pausing", "mode": "now", "stage": stage, "running": 1, "stop_failures": []}),
+            ),
+            effect: Some("pause"),
+        },
+        Route {
+            args: vec!["task", "resume", "{}"],
+            requests: vec![("POST", t("/resume"), "")],
+            stdout: Some(serde_json::json!({"stage": stage, "started": [stage], "resumed": []})),
+            effect: Some("resume"),
+        },
+        Route {
+            args: vec!["task", "reconfigure", "{}", "--role-model", "coder=opus"],
+            requests: vec![(
+                "PATCH",
+                t(""),
+                r#"{"config":{"roles":{"coder":{"model":"opus"}}}}"#,
+            )],
+            stdout: Some(reconfigured),
+            effect: Some("config"),
+        },
+    ];
+
+    for route in &routes {
+        let args = fx_fill(&route.args, prefix);
+        let why = format!("{args:?}");
+        let effects_before = server.effects().len();
+        let out = fx_run(&server, &args).await;
+        assert_eq!(out.code, Some(0), "{why}: {}", out.stderr);
+        match &route.stdout {
+            Some(expected) => assert_eq!(&out.json(), expected, "{why}"),
+            None => assert_eq!(out.stdout, "", "{why}"),
+        }
+        let mut expected = vec![FxReq {
+            method: "GET".into(),
+            target: "/tasks".into(),
+            body: String::new(),
+        }];
+        expected.extend(route.requests.iter().map(|(m, t, b)| FxReq {
+            method: m.to_string(),
+            target: t.clone(),
+            body: b.to_string(),
+        }));
+        let got = server.take_requests();
+        assert_eq!(got, expected, "{why}");
+        let effects = server.effects();
+        let new_effects = &effects[effects_before..];
+        match route.effect {
+            Some(verb) => assert_eq!(new_effects, [(ID_A.to_string(), verb.to_string())], "{why}"),
+            None => assert_eq!(new_effects, [], "{why}"),
+        }
+    }
+    // Only the selected task ever took a mutation.
+    assert!(
+        server.effects().iter().all(|(id, _)| id == ID_A),
+        "{:?}",
+        server.effects()
+    );
+
+    // The daemon's own refusal of a lifecycle change still ends the command.
+    server.set(|s| {
+        s.refuse = true;
+        s.effects.clear();
+    });
+    for template in fx_commands()
+        .into_iter()
+        .filter(|c| !matches!(c[1], "status" | "events"))
+    {
+        let args = fx_fill(&template, prefix);
+        let why = format!("{args:?}");
+        let out = fx_run(&server, &args).await;
+        assert_eq!(out.code, Some(1), "{why}");
+        assert_eq!(out.stdout, "", "{why}");
+        assert_eq!(out.stderr, format!("error: {REFUSAL_SENTINEL}\n"), "{why}");
+        server.take_requests();
+    }
+    assert_eq!(server.effects(), vec![]);
+}
+
+/// Real daemon, real state change: reconfigure by an eight-byte prefix
+/// changes the intended task only.
+#[tokio::test]
+async fn task_prefix_reconfigure_changes_only_selected_task() {
+    let home = TempHome::new();
+    let wf_path = home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let mut ids = Vec::new();
+    for title in ["target", "bystander"] {
+        let created = run_choco_json(
+            &daemon.base_url,
+            &[
+                "task",
+                "create",
+                "--project",
+                &project_id,
+                "--workflow",
+                wf_path.to_str().unwrap(),
+                "--title",
+                title,
+                "--prompt",
+                "hello",
+                "--role-model",
+                "coder=opus",
+                "--role-model",
+                "reviewer=haiku",
+            ],
+        )
+        .await;
+        assert_eq!(created.code, Some(0), "{}", created.stderr);
+        ids.push(created.json()["id"].as_str().unwrap().to_string());
+    }
+    let (target, bystander) = (ids[0].clone(), ids[1].clone());
+    // The two random ids must differ within the prefix for it to mean anything.
+    assert_ne!(target[..8], bystander[..8], "random ids collided; rerun");
+
+    let before = reqwest::get(format!("{}/tasks/{bystander}", daemon.base_url))
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+
+    let patched = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "reconfigure",
+            &target[..8],
+            "--role-model",
+            "coder=sonnet",
+        ],
+    )
+    .await;
+    assert_eq!(patched.code, Some(0), "{}", patched.stderr);
+    let patched = patched.json();
+    assert_eq!(patched["id"], target.as_str());
+    assert_eq!(patched["config"]["roles"]["coder"]["model"], "sonnet");
+
+    let get = |id: String| {
+        let url = format!("{}/tasks/{id}", daemon.base_url);
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let target_after = get(target.clone()).await;
+    assert_eq!(target_after["title"], "target");
+    assert_eq!(target_after["config"]["roles"]["coder"]["model"], "sonnet");
+    assert_eq!(
+        target_after["config"]["roles"]["reviewer"]["model"],
+        "haiku"
+    );
+    let bystander_after = get(bystander.clone()).await;
+    assert_eq!(bystander_after["config"], before["config"]);
+    assert_eq!(bystander_after["config"]["roles"]["coder"]["model"], "opus");
+}
+
+/// A prefix watch looks the task up once, then polls the stored full id
+/// until the task really changes, and keeps the watch's exit codes.
+#[tokio::test]
+async fn task_prefix_watch_resolves_once() {
+    for extra in [&["--until", "closed"][..], &["--live"][..]] {
+        let server = fx_start_mixed().await;
+        let prefix = &ID_A[..12];
+        let mut child = Command::new(env!("CARGO_BIN_EXE_choco"))
+            .args(["--json", "--base-url", &server.base_url])
+            .args(["task", "status", prefix, "--interval", "1s"])
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut first = String::new();
+        // Each stdout read is bounded: a lookup or poll that never answers
+        // fails the test (the dropped child is killed) instead of hanging it.
+        tokio::time::timeout(LOAD_ALLOWANCE, stdout.read_line(&mut first))
+            .await
+            .expect("no first frame within LOAD_ALLOWANCE")
+            .unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["id"], ID_A);
+        assert_eq!(first["status"], "open");
+        // A second lookup would be refused, so a re-resolving watch fails.
+        server.set(|s| s.list = FxList::Api);
+        // The transition is released only after the first frame was seen.
+        wait_until("a second poll of the task", || async {
+            let n = server
+                .inner
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| r.target == format!("/tasks/{ID_A}"))
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!("{n} polls"))
+            }
+        })
+        .await;
+        server.set(|s| s.released = true);
+        let mut rest = String::new();
+        tokio::time::timeout(LOAD_ALLOWANCE, stdout.read_to_string(&mut rest))
+            .await
+            .expect("watcher stdout did not reach EOF within LOAD_ALLOWANCE")
+            .unwrap();
+        let (code, stderr) = finish_watcher(child).await;
+        assert_eq!(code, Some(0), "{extra:?}: {stderr}");
+        let last: Value = serde_json::from_str(rest.lines().last().unwrap()).unwrap();
+        assert_eq!(last["id"], ID_A);
+        assert_eq!(last["status"], "closed");
+        for line in rest.lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["id"], ID_A, "{line}");
+        }
+        let lines = FxServer::lines(&server.take_requests());
+        assert_eq!(
+            lines.iter().filter(|l| *l == "GET /tasks").count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l == "GET /tasks" || l == &format!("GET /tasks/{ID_A}")),
+            "{lines:?}"
+        );
+        assert!(lines.len() >= 3, "{lines:?}");
+    }
+
+    // The watch's other exits, through a prefix.
+    let server = fx_start_mixed().await;
+    let paused = "0aaaaaa3-1111-4222-8333-000000000003";
+    let open = "0aaaaaa1-1111-4222-8333-000000000001";
+    let run = |p: &str, extra: &[&str]| {
+        let mut args = vec!["task", "status", p, "--interval", "1s"];
+        args.extend_from_slice(extra);
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let base = server.base_url.clone();
+        async move {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_choco(&base, &refs).await
+        }
+    };
+    let out = run(&paused[..8], &["--until", "closed"]).await;
+    assert_eq!(out.code, Some(7), "{}", out.stderr);
+    assert!(out.stderr.contains(paused), "{}", out.stderr);
+    let out = run(&paused[..8], &["--until", "paused"]).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    let out = run(&open[..8], &["--until", "closed", "--timeout", "2s"]).await;
+    assert_eq!(out.code, Some(5), "{}", out.stderr);
+    assert!(out.stderr.contains(open), "{}", out.stderr);
+}
+
+/// `events` through a prefix pages exactly as the full id does.
+#[tokio::test]
+async fn task_prefix_events_pagination() {
+    let server = fx_start_mixed().await;
+    let prefix = &ID_A[..12];
+    let expected = fx_expected_events(&server, ID_A);
+    assert_eq!(expected.len(), 2);
+
+    let first = run_choco_json(
+        &server.base_url,
+        &["task", "events", prefix, "--limit", "1"],
+    )
+    .await;
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    assert_eq!(
+        first.json(),
+        serde_json::json!({ "events": [expected[0].clone()], "next_token": "tok-1" })
+    );
+    let second = run_choco_json(
+        &server.base_url,
+        &["task", "events", prefix, "--limit", "1", "--after", "tok-1"],
+    )
+    .await;
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    assert_eq!(
+        second.json(),
+        serde_json::json!({ "events": [expected[1].clone()], "next_token": null })
+    );
+    server.take_requests();
+
+    // The same pages by full id are identical.
+    let full_first =
+        run_choco_json(&server.base_url, &["task", "events", ID_A, "--limit", "1"]).await;
+    let full_second = run_choco_json(
+        &server.base_url,
+        &["task", "events", ID_A, "--limit", "1", "--after", "tok-1"],
+    )
+    .await;
+    assert_eq!(full_first.json(), first.json());
+    assert_eq!(full_second.json(), second.json());
+    assert_eq!(
+        FxServer::lines(&server.take_requests()),
+        vec![
+            format!("GET /tasks/{ID_A}/events?limit=1"),
+            format!("GET /tasks/{ID_A}/events?limit=1&after=tok-1"),
+        ]
+    );
+}
+
+/// A failed task list is reported as what it was; it is never read as "no
+/// such task" and never lets the mutation through.
+#[tokio::test]
+async fn task_prefix_list_errors() {
+    let server = fx_start_mixed().await;
+    let good_row = fx_task(&server, ID_A).summary();
+    let with_id = |id: Value| {
+        let mut row = good_row.clone();
+        match id {
+            Value::String(s) if s == "<missing>" => {
+                row.as_object_mut().unwrap().remove("id");
+            }
+            other => row["id"] = other,
+        }
+        Value::Array(vec![row]).to_string()
+    };
+
+    let decode_bodies = [
+        "not json at all".to_string(),
+        "null".to_string(),
+        r#"{"tasks":[]}"#.to_string(),
+        with_id(Value::String("<missing>".into())),
+        with_id(Value::Null),
+        with_id(serde_json::json!(8347)),
+    ];
+    for body in decode_bodies {
+        server.set(|s| s.list = FxList::Body(body.clone()));
+        let out = run_choco_json(&server.base_url, &["task", "cancel", &ID_A[..8]]).await;
+        assert_eq!(out.code, Some(1), "{body}");
+        assert_eq!(out.stdout, "", "{body}");
+        assert!(
+            out.stderr
+                .starts_with("error: unexpected response from chocofactoryd:"),
+            "{body}: {}",
+            out.stderr
+        );
+        assert_eq!(
+            FxServer::lines(&server.take_requests()),
+            vec!["GET /tasks".to_string()],
+            "{body}"
+        );
+    }
+
+    server.set(|s| s.list = FxList::Api);
+    let out = run_choco_json(&server.base_url, &["task", "cancel", &ID_A[..8]]).await;
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, format!("error: {LIST_SENTINEL}\n"));
+    assert_eq!(
+        FxServer::lines(&server.take_requests()),
+        vec!["GET /tasks".to_string()]
+    );
+    assert_eq!(server.effects(), vec![]);
+
+    // No daemon at all: the connection error, not a refusal about the id.
+    let base_url = format!("http://127.0.0.1:{}", free_port());
+    let out = run_choco_json(&base_url, &["task", "cancel", &ID_A[..8]]).await;
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr
+            .starts_with("error: failed to connect to chocofactoryd at"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// SIGINT while the task list is still pending ends the command without
+/// any request on a task and leaves every task as it was.
+#[tokio::test]
+async fn task_prefix_interrupted_lookup() {
+    use std::os::unix::process::ExitStatusExt;
+    let server = fx_start_mixed().await;
+    server.set(|s| s.list = FxList::Hold);
+    let before: Vec<String> = fx_mixed_tasks()
+        .iter()
+        .map(|t| t.status.to_string())
+        .collect();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_choco"))
+        .args(["--json", "--base-url", &server.base_url])
+        .args(["task", "cancel", &ID_A[..8]])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_until("the held GET /tasks", || async {
+        let seen = server.inner.lock().unwrap().requests.len();
+        if seen >= 1 {
+            Ok(())
+        } else {
+            Err("no request yet".to_string())
+        }
+    })
+    .await;
+    let pid = child.id().expect("child still running") as i32;
+    // SAFETY: plain signal delivery to a child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let status = tokio::time::timeout(LOAD_ALLOWANCE, child.wait())
+        .await
+        .expect("choco did not exit after SIGINT")
+        .unwrap();
+    assert!(!status.success());
+    // Observed representation: killed by signal 2 (no exit code).
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .await
+        .unwrap();
+    assert_eq!(stdout, "");
+
+    wait_until("the held list handler to be dropped", || async {
+        if server.inner.lock().unwrap().hold_dropped {
+            Ok(())
+        } else {
+            Err("handler still held".to_string())
+        }
+    })
+    .await;
+    assert_eq!(
+        FxServer::lines(&server.take_requests()),
+        vec!["GET /tasks".to_string()]
+    );
+    assert_eq!(server.effects(), vec![]);
+    let after: Vec<String> = server
+        .inner
+        .lock()
+        .unwrap()
+        .tasks
+        .iter()
+        .map(|t| t.status.to_string())
+        .collect();
+    assert_eq!(after, before);
 }

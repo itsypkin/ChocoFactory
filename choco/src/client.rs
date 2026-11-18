@@ -35,6 +35,11 @@ pub struct InitWorkflowsResult {
     pub existing: Vec<String>,
 }
 
+/// Length of a stored task id (a hyphenated UUID), in bytes.
+const FULL_TASK_ID_LEN: usize = 36;
+/// Shortest task id prefix `choco` resolves.
+const MIN_TASK_ID_PREFIX_LEN: usize = 8;
+
 /// Mirrors this repo's hand-rolled `Display`-impl error convention
 /// (`ApiError`, `EngineError`, ...) rather than pulling in `anyhow`/`thiserror`.
 #[derive(Debug)]
@@ -54,6 +59,12 @@ pub enum ClientError {
     /// constraint (`0001_init.sql`), so this is a reachable state, not a
     /// theoretical one. Resolved by passing the id instead.
     AmbiguousProject { name: String, ids: Vec<String> },
+    /// A task id argument was shorter than a usable prefix, or no task id
+    /// starts with it. Carries the argument as typed.
+    NoSuchTask(String),
+    /// A task id prefix matched several tasks; `ids` holds every matching
+    /// full id, sorted ascending. Nothing was run.
+    AmbiguousTask { prefix: String, ids: Vec<String> },
     /// A `--role-*`/`--config` flag couldn't be turned into task config.
     /// Always reported rather than skipped: silently dropping an override
     /// would run the task on a model the caller didn't ask for.
@@ -91,6 +102,10 @@ impl fmt::Display for ClientError {
                 ids.len(),
                 ids.join(", ")
             ),
+            ClientError::NoSuchTask(input) => write!(f, "no such task '{input}'"),
+            ClientError::AmbiguousTask { prefix, ids } => {
+                write!(f, "ambiguous id '{prefix}': {}", ids.join(", "))
+            }
             ClientError::InvalidConfig(msg) => write!(f, "{msg}"),
             ClientError::InvalidRepoPath(msg) => write!(f, "{msg}"),
             ClientError::InvalidWorkflowPath(msg) => write!(f, "{msg}"),
@@ -537,6 +552,38 @@ impl Client {
             many => Err(ClientError::AmbiguousProject {
                 name: name_or_id.to_string(),
                 ids: many.iter().map(|p| p.id.clone()).collect(),
+            }),
+        }
+    }
+
+    /// Resolves a `choco task` id argument to the stored full task id: a full
+    /// id or a unique literal, case-sensitive prefix of one.
+    ///
+    /// Length alone decides the path: `FULL_TASK_ID_LEN` bytes or more is
+    /// returned unchanged (the endpoint reports an unknown one), fewer than
+    /// `MIN_TASK_ID_PREFIX_LEN` is refused without any request, and anything
+    /// between is matched against one unfiltered `GET /tasks` — every
+    /// project and status. Read-only: nothing is written or cached.
+    pub async fn resolve_task_id(&self, input: &str) -> Result<String, ClientError> {
+        if input.len() >= FULL_TASK_ID_LEN {
+            return Ok(input.to_string());
+        }
+        if input.len() < MIN_TASK_ID_PREFIX_LEN {
+            return Err(ClientError::NoSuchTask(input.to_string()));
+        }
+        let tasks = self.list_tasks(None, None).await?;
+        let mut ids: Vec<String> = tasks
+            .into_iter()
+            .map(|t| t.task.id)
+            .filter(|id| id.starts_with(input))
+            .collect();
+        ids.sort();
+        match ids.len() {
+            0 => Err(ClientError::NoSuchTask(input.to_string())),
+            1 => Ok(ids.remove(0)),
+            _ => Err(ClientError::AmbiguousTask {
+                prefix: input.to_string(),
+                ids,
             }),
         }
     }

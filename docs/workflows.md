@@ -80,7 +80,7 @@ canonical absolute path and a SHA-256 of its contents at that moment — and
 `choco task status` shows it:
 
 ```
-$ choco task status bb93ada3-...
+$ choco task status bb93ada3
 ...
 Workflow       coding-task
 Workflow file  /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml  [3f2a9c1e0b7d]

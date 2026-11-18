@@ -304,7 +304,8 @@ pub enum TaskCmd {
     #[command(verbatim_doc_comment)]
     #[command(group(ArgGroup::new("watching").args(["live", "until"]).multiple(true)))]
     Status {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         /// Keep the view current until the task closes or is cancelled.
         /// On a terminal the view is redrawn every poll; piped, one line is
@@ -327,7 +328,8 @@ pub enum TaskCmd {
     },
     /// Send a message into a task's active session (or resume a human_gate).
     Send {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         #[arg(long)]
         text: String,
@@ -340,7 +342,8 @@ pub enum TaskCmd {
     /// undone: a cancelled task accepts no further messages. The branch tip
     /// is recorded on the task's timeline before the branch is deleted.
     Cancel {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         /// Keep both the worktree and the branch and hand them to a person.
         /// Anything re-entering the task later would collide with them.
@@ -365,7 +368,8 @@ pub enum TaskCmd {
     /// of work it knows nothing about (#92). Anything the agent itself did
     /// wrong starts fresh.
     Retry {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         /// Resume the interrupted session, and fail if it cannot be resumed
         /// rather than quietly starting a fresh one.
@@ -385,7 +389,8 @@ pub enum TaskCmd {
     /// continues the same session where it can) and shell commands are
     /// killed (resume runs them again). `choco task resume` undoes either.
     Pause {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         /// Also stop running agent turns and kill running shell commands.
         #[arg(long)]
@@ -397,7 +402,8 @@ pub enum TaskCmd {
     /// keeps its place in line. An agent turn stopped by `pause --now` picks
     /// up its session where it can.
     Resume {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
     },
     /// List tasks, optionally filtered by project, status and/or a search.
@@ -423,14 +429,16 @@ pub enum TaskCmd {
     /// the task's next turn — a session already running keeps the config it
     /// started with.
     Reconfigure {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         #[command(flatten)]
         roles: RoleOverrideArgs,
     },
     /// Show a task's recorded events (the agent conversation and tool calls).
     Events {
-        /// Task id.
+        /// Task id: the full id, or a unique prefix of at least 8 characters
+        /// (case-sensitive; an ambiguous prefix lists its matches and does nothing).
         id: String,
         /// Maximum events to return. The daemon caps this at 500.
         #[arg(long)]
@@ -440,6 +448,25 @@ pub enum TaskCmd {
         #[arg(long, value_name = "NEXT_TOKEN")]
         after: Option<String>,
     },
+}
+
+impl TaskCmd {
+    /// The task id argument of the commands that act on one existing task;
+    /// `None` for `create` and `list`. Pure: it does no I/O, so `main` can
+    /// resolve a short id into it in one place before anything is dispatched.
+    pub fn id_mut(&mut self) -> Option<&mut String> {
+        match self {
+            TaskCmd::Status { id, .. }
+            | TaskCmd::Send { id, .. }
+            | TaskCmd::Cancel { id, .. }
+            | TaskCmd::Retry { id, .. }
+            | TaskCmd::Pause { id, .. }
+            | TaskCmd::Resume { id }
+            | TaskCmd::Reconfigure { id, .. }
+            | TaskCmd::Events { id, .. } => Some(id),
+            TaskCmd::Create(_) | TaskCmd::List { .. } => None,
+        }
+    }
 }
 
 #[derive(Args)]
