@@ -856,7 +856,7 @@ async fn a_launch_that_fails_after_the_clear_leaves_it_cleared_and_a_fresh_retry
 }
 
 #[tokio::test]
-async fn a_launch_dropped_while_clearing_commits_nothing_and_the_next_one_starts() {
+async fn a_launch_dropped_while_clearing_leaves_a_settled_state_and_the_next_one_starts() {
     let dir = tempdir();
     let db_path = dir.join("abandon.db");
     let pool = crate::db::connect(&db_path).await.unwrap();
@@ -926,14 +926,30 @@ async fn a_launch_dropped_while_clearing_commits_nothing_and_the_next_one_starts
     launch.abort();
     assert!(launch.await.unwrap_err().is_cancelled());
 
-    // Whatever the aborted write was, it did not commit: another connection
-    // sees the state exactly as it was, no session, no result.
+    // Dropping the launch does not cancel the statement SQLite is already
+    // waiting on in its worker thread, so once the lock is released the clear
+    // may still land. Either way the one write is atomic and nothing else
+    // moves: another connection sees the state as it was, or as it was without
+    // the cleared capture, and no session and no result exist.
     sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
     drop(writer);
-    // Long enough for a write that outlived the launch to land (SQLite's
-    // busy handler retries within a few tens of milliseconds).
     tokio::time::sleep(StdDuration::from_millis(700)).await;
-    assert_eq!(untouched(&observer, &task_id).await, before);
+    let (mut payload, counters, stage, sessions_after, results_after) =
+        untouched(&observer, &task_id).await;
+    let mut expected = before.0.clone();
+    if payload["stages"].get("review").is_none() {
+        expected["stages"].as_object_mut().unwrap().remove("review");
+    }
+    assert_eq!(
+        payload, expected,
+        "the dropped clear changed more than the capture"
+    );
+    payload["stages"] = Value::Null;
+    assert_eq!(
+        (counters, stage, sessions_after, results_after),
+        (before.1.clone(), before.2.clone(), 0, 0),
+        "{payload}"
+    );
     assert_eq!(
         engine.running_total(),
         0,
@@ -961,8 +977,7 @@ async fn a_launch_dropped_while_clearing_commits_nothing_and_the_next_one_starts
         .launch_turn(prepared, Some(permit), None)
         .await
         .unwrap();
-    let delivered = delivered_to(&pool, &session_id).await;
-    assert!(delivered.contains(OLD), "{delivered}");
+    delivered_to(&pool, &session_id).await;
     wait_until_task_status(&pool, &task_id, "closed").await;
     let done = state_of(&observer, &task_id).await;
     assert_eq!(done.payload["stages"]["review"]["summary"], json!(NEW));
