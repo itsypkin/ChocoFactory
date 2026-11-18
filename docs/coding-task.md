@@ -38,7 +38,9 @@ spec suggests.
 
 From then on the coder, the internal reviewer and the writer work from the
 planner's report, not from your `--prompt` (the coder and reviewer read it
-through the context tool; the writer's prompt carries it). Read it with:
+through the context tool; the writer's prompt carries it). Read it once
+`spec_check` has finished a lap; while a new lap of `spec_check` runs, this
+text is empty, not the earlier lap's:
 
 ```
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
