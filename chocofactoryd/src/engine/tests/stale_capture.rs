@@ -496,7 +496,18 @@ async fn failed_capture_clear_starts_no_agent() {
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
     let task_id = seed_task(&pool, &def.name).await;
     engine.start_task(&task_id, &def, None).await.unwrap();
-    wait_until_task_status(&pool, &task_id, "stuck").await;
+    // Stuck is where a refused clear ends; a second review run is where a
+    // clear whose failure was ignored ends. Waiting for either lets the
+    // assertion below name which one happened.
+    crate::test_support::wait_until("the task stuck or a second attempt", || async {
+        let stuck = tasks::get(&pool, &task_id).await.unwrap().unwrap().status == "stuck";
+        if stuck || review_runs(&pool, &task_id).await.len() > 1 {
+            Ok(())
+        } else {
+            Err("still launching".to_string())
+        }
+    })
+    .await;
 
     // The protected effect first: no second attempt exists. Ignoring the
     // clear's error starts one, and this is the assertion that fails.
