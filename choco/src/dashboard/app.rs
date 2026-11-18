@@ -23,8 +23,8 @@ const MAX_EVENTS: usize = 1000;
 pub enum Section {
     NeedsYou,
     InProgress,
-    /// Tasks an operator paused, and the ones still finishing a turn
-    /// before they are paused.
+    /// Tasks an operator paused and that have settled. A task still
+    /// finishing a turn before it pauses (`pausing`) stays in `InProgress`.
     Paused,
     Stuck,
     Closed,
@@ -470,7 +470,11 @@ impl App {
         for t in &self.active {
             match t.task.status.as_str() {
                 TASK_STATUS_STUCK => stuck.push(t),
-                TASK_STATUS_PAUSING | TASK_STATUS_PAUSED => paused.push(t),
+                // A pause was requested but the daemon has not reported
+                // `paused` yet (work may still be running or settling), so it
+                // stays in progress until the status says `paused`.
+                TASK_STATUS_PAUSING => progress.push(t),
+                TASK_STATUS_PAUSED => paused.push(t),
                 TASK_STATUS_OPEN => {
                     if t.waiting_on_human {
                         needs.push(t);

@@ -747,10 +747,17 @@ scrollable list in five sections:
 | Section | Holds | Ordered |
 |---|---|---|
 | Needs you | `open` tasks at a `human_gate`, in any workflow | longest waiting first |
-| In progress | every other `open` task, with its laps (the largest loop counter, `×N`) | longest in its stage first |
-| Paused | `pausing` and `paused` tasks; the time column reads "paused for" | longest paused first |
+| In progress | every other `open` task, and every `pausing` task (its stage reads `<stage> · pausing` where the column fits), with its laps (the largest loop counter, `×N`) | longest in its stage first |
+| Paused | `paused` tasks only; the time column reads "paused for" | longest paused first |
 | Stuck | `stuck` tasks, whatever their stage, with the first line of the reason | longest stuck first |
 | Recently closed | the latest `closed` and `cancelled` tasks | newest first |
+
+A `pausing` task has had a pause asked for but the daemon has not yet reported
+it `paused` (work may still be running or settling), so it stays under In
+progress, with its time in its stage, until its status is `paused`; only then
+does it move to Paused. "Paused for" counts from when the pause was asked for
+(the `Paused` time of `choco task status`), so it includes the time the
+finishing turn took. It does not start at the moment the task settled.
 
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column

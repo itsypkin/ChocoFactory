@@ -373,6 +373,12 @@ had failed unapplied: that task is `stuck`.
 A turn that fails while the task is `pausing` makes it `stuck`, and
 `choco task cancel` works from either status.
 
+In `choco dashboard` a `pausing` task stays under IN PROGRESS, with its time
+in stage (and `· pausing` after the stage where the column fits); it moves to
+PAUSED only once its status is `paused`. The PAUSED "paused for" time counts
+from when the pause was asked for, so it includes the time the finishing turn
+took.
+
 To wait for a pause: `choco task status <id> --until paused`. Any other
 `--until` target ends with exit 7 when the task pauses, and `--until attention`
 returns with exit 0.
