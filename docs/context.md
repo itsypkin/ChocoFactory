@@ -100,8 +100,10 @@ anything.
 A task from before results were recorded can answer a `stage` request with its
 latest stored capture, marked as such. This is the only fallback, and it needs
 no `anchor_id`, no `result_id`, no `outcome`, and no `current_result_id`. That
-stored capture is the stage's live text, which the daemon removes when a new
-attempt of the stage launches, so after that the answer is `missing_snapshot`:
+stored capture is the stage's live text. The daemon removes it when a new
+attempt of an agent-turn stage launches, so after that the answer for such a
+stage is `missing_snapshot` (a shell, poll or human-gate stage keeps its
+snapshot):
 
 ```
 {"provenance":"snapshot","task_id":"…","anchor_id":null,"stage":"review",

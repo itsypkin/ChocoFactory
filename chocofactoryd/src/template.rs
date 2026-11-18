@@ -107,8 +107,10 @@ pub enum TemplateError {
     /// declares a `capture:`, so this means it hasn't finished a run yet
     /// (`render` reports that as `UnresolvedKind::StageNotRunYet`), its
     /// capture was removed when a new attempt of the agent-turn stage
-    /// launched (#353; it has finished before, so `render` reports that as
-    /// `UnresolvedKind::Missing`), or it
+    /// launched (#353; `render` reports that as `UnresolvedKind::Missing`
+    /// when the stage is listed in the payload's `finished_stages`, as it is
+    /// once it has completed a run, and as `StageNotRunYet` for a legacy
+    /// payload without that marker), or it
     /// finished without storing a capture (a shell command that failed to
     /// spawn, a poll's error or timeout, a capture over the size limit).
     UnresolvedStage {

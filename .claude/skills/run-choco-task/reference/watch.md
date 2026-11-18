@@ -97,8 +97,8 @@ curl --silent --show-error --get "$DAEMON/tasks/$ID/context" \
 ```
 
 `snapshot` is a legacy answer for a task from before results were recorded: it
-is the stage's live text, so it is gone once the stage has started a new
-attempt. `unavailable` names a limitation (`reason`), such as pruned or
+is the stage's live text, so it is gone once an agent-turn stage has launched
+a new attempt (a shell, poll or human-gate stage keeps it). `unavailable` names a limitation (`reason`), such as pruned or
 never-recorded history; it does not say the stage never ran or approved.
 History is pruned with the other events and not back-filled, so an old task may
 have none. See [docs/context.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/context.md).

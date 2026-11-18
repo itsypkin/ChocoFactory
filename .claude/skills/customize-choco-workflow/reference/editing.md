@@ -110,9 +110,11 @@ launches (a shell, poll or human-gate stage keeps its last capture), so
 lap's text on the first prompt it renders and delivers, and a later fresh
 re-render (`choco task retry --fresh`, or recovery after a crash before the
 prompt was delivered) may render it empty; a supported resume keeps the
-session's existing transcript. Other stages' captures are not removed. Before the
-attempt launches (queued for a slot, held by a pause, or a failure before the
-agent starts) the old capture is still there.
+session's existing transcript. Other stages' captures are not removed. While
+the attempt is queued for a slot or held by a pause, and when a failure comes
+before the capture is cleared (rendering the prompt, taking a read-only
+baseline, or the clearing write itself), the old capture is still there; once
+the clear has succeeded it stays gone even if the session then fails to start.
 
 ## Shell stages
 
