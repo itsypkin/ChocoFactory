@@ -31,7 +31,8 @@ It holds:
 The newest result's ID is kept in the task's workflow payload as
 `current_result_id`. The stage's live text in the same payload (`stages.<name>`,
 what `choco task status` shows) is a different thing: it is removed when a new
-attempt of that stage launches, so once an attempt is running it is never an
+attempt of an agent-turn stage launches (a shell, poll or human-gate stage keeps
+its last text), so once an attempt is running it is never an
 earlier attempt's verdict shown as the new one's, while the recorded results
 keep every applied verdict. (Before that — queued for a slot, held by a pause,
 or failed before launch — it is still the previous run's text.) History is ordered only by these links, never by

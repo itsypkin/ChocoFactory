@@ -2921,3 +2921,58 @@ async fn parallel_launch_clears_each_restarted_capture_without_restoring_another
         "a restarted branch's old capture is still live, or another stage's was removed"
     );
 }
+
+// #353: a retry that re-runs only the failed branch clears that branch's
+// previous capture and leaves its finished sibling's exactly as it was.
+#[tokio::test]
+async fn a_mixed_retry_clears_only_the_rerun_branchs_capture() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", report_steps("clean", "sum-one")),
+        ("BRANCH-TWO", report_steps("bogus", "x")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let state = g.state().await;
+    let sibling = state.payload["stages"]["one"].clone();
+    assert_eq!(sibling["summary"], json!("sum-one"), "the finished sibling");
+    // The failed branch's slot has an earlier entry's capture to drop.
+    let mut payload = state.payload.clone();
+    payload["stages"]["two"] = json!({"outcome": "clean", "summary": "OLD-TWO-CAPTURE"});
+    workflow_state::update(
+        &g.pool,
+        &g.task_id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage,
+            stage_kind: state.stage_kind.unwrap(),
+            loop_counters: state.loop_counters,
+            payload,
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    set_script(
+        &g,
+        by_prompt(&[
+            ("BRANCH-ONE", hold_steps()),
+            ("BRANCH-TWO", hold_steps()),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert_eq!(outcome.branches.len(), 1);
+    assert_eq!(outcome.branches[0].branch, "two");
+    g.wait_sessions("two", 2).await;
+    assert_eq!(g.sessions("one").await.len(), 1, "the sibling was re-run");
+
+    let after = g.state().await.payload;
+    assert_eq!(after["stages"]["one"], sibling);
+    assert!(
+        after["stages"].get("two").is_none(),
+        "the re-run branch's old capture is still live: {:?}",
+        after["stages"]["two"]
+    );
+}

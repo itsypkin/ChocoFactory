@@ -104,12 +104,15 @@ an unknown stage, or to a stage without `capture:`, is rejected at load. A
 value that doesn't exist yet renders empty. A literal `{{` can't be written
 in these places.
 
-A stage's capture is removed when a new attempt of that stage launches, so
+The capture of an agent-turn stage is removed when a new attempt of that stage
+launches (a shell, poll or human-gate stage keeps its last capture), so
 `{{ stages.<stage>.summary }}` in that stage's own prompt shows the previous
 lap's text on the first prompt it renders and delivers, and a later fresh
 re-render (`choco task retry --fresh`, or recovery after a crash before the
 prompt was delivered) may render it empty; a supported resume keeps the
-session's existing transcript. Other stages' captures are not removed.
+session's existing transcript. Other stages' captures are not removed. Before the
+attempt launches (queued for a slot, held by a pause, or a failure before the
+agent starts) the old capture is still there.
 
 ## Shell stages
 

@@ -5,6 +5,7 @@
 //! for `claude`, never the real CLI and never a real usage limit.
 
 use super::super::turn::remove_stage_capture;
+use super::super::turns::{Claim, TurnSpec};
 use super::*;
 use crate::context::{self, ContextRequest, Lookup};
 use chocofactory_core::context::{AppliedStageResult, ContextResponse};
@@ -345,11 +346,25 @@ async fn fresh_retry_preserves_self_reference_contract() {
     assert!(live_review(&state.payload).is_none());
 }
 
+/// The `is_error` flag of every `report_outcome` result recorded for a
+/// session: one entry per result the daemon has stored.
+async fn recorded_report_results(pool: &SqlitePool, session_id: &str) -> Vec<bool> {
+    events::list_for_session(pool, session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::ToolResult)
+        .filter(|e| e.payload["tool_use_id"] == "toolu_report_1")
+        .map(|e| e.payload["is_error"].as_bool().unwrap_or(false))
+        .collect()
+}
+
 #[tokio::test]
 async fn accepted_unapplied_report_never_becomes_live() {
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let def = flow_in(&dir);
+    let hold = dir.join("hold-after-report");
     let binary = named_script_binary(
         &dir,
         "fake-claude-unapplied",
@@ -362,6 +377,7 @@ async fn accepted_unapplied_report_never_becomes_live() {
             "OLD-REVIEW-MARK": [
                 {"op": "echo_turn"},
                 {"op": "report", "outcome": "done", "summary": UNAPPLIED},
+                {"op": "wait_file", "path": hold},
                 {"op": "usage_limit"},
             ],
         }}),
@@ -369,8 +385,40 @@ async fn accepted_unapplied_report_never_becomes_live() {
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
     let task_id = seed_task(&pool, &def.name).await;
     engine.start_task(&task_id, &def, None).await.unwrap();
-    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let runs = wait_for_review_runs(&pool, &task_id, 2).await;
+    let second = runs.iter().max_by_key(|s| s.started_at).cloned().unwrap();
 
+    // The second report was accepted and stored, and the turn has not ended:
+    // this is the condition the rest of the test is about.
+    crate::test_support::wait_until("the second report's accepted result", || async {
+        match recorded_report_results(&pool, &second.id).await.as_slice() {
+            [false] => Ok(()),
+            other => Err(format!("report results so far: {other:?}")),
+        }
+    })
+    .await;
+    let before_results = stage_results(&pool, &task_id).await;
+    let before = state_of(&pool, &task_id).await;
+    assert_eq!(before.current_stage, "review");
+    assert_eq!(
+        before_results.len(),
+        2,
+        "plan→review and the one applied review"
+    );
+    assert_eq!(
+        before.payload["current_result_id"],
+        json!(before_results.last().unwrap().id)
+    );
+    assert!(
+        live_review(&before.payload).is_none(),
+        "an accepted-but-unapplied report is shown as live: {:?}",
+        live_review(&before.payload)
+    );
+
+    // The usage limit interrupts the turn after its accepted report: nothing
+    // is applied, nothing goes live, and the history is exactly as it was.
+    release(&hold);
+    wait_until_task_status(&pool, &task_id, "stuck").await;
     let state = state_of(&pool, &task_id).await;
     assert_eq!(state.current_stage, "review");
     assert!(
@@ -378,8 +426,15 @@ async fn accepted_unapplied_report_never_becomes_live() {
         "an accepted-but-unapplied report is shown as live: {:?}",
         live_review(&state.payload)
     );
+    assert_eq!(
+        state.payload["current_result_id"],
+        before.payload["current_result_id"]
+    );
     let results = stage_results(&pool, &task_id).await;
-    assert_eq!(results.len(), 2, "plan→review and the one applied review");
+    assert_eq!(
+        results.iter().map(|e| &e.id).collect::<Vec<_>>(),
+        before_results.iter().map(|e| &e.id).collect::<Vec<_>>()
+    );
     assert!(
         !results
             .iter()
@@ -536,4 +591,664 @@ fn removing_a_capture_covers_every_shape_of_payload() {
         assert!(!remove_stage_capture(&mut payload, "review"));
         assert_eq!(payload, untouched);
     }
+}
+
+// ---- the launch boundary ---------------------------------------------------
+
+/// Seeds the state a second entry into `review` starts from: the other
+/// stage's hand-off, the previous verdict, and a pointer to the applied history.
+async fn seed_review_state(pool: &SqlitePool, task_id: &str) {
+    workflow_state::create(
+        pool,
+        task_id,
+        "review",
+        "agent_turn",
+        json!({
+            "stages": {
+                "plan": "HANDOFF-FROM-PLAN",
+                "review": {"outcome": "again", "summary": OLD},
+            },
+            "current_result_id": "result-pointer",
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// Prepares `review`'s turn from the persisted state and launches it, running
+/// `between` once the turn is prepared and before the launch.
+async fn launch_review(
+    engine: &Arc<WorkflowEngine>,
+    def: &Arc<WorkflowDefinition>,
+    task_id: &str,
+    between: Option<&str>,
+) -> Result<String, EngineError> {
+    let state = workflow_state::get(&engine.pool, task_id)
+        .await?
+        .ok_or(EngineError::NoWorkflowState)?;
+    let entry = StageEntry {
+        task_id,
+        definition: def,
+        stage_name: "review",
+        stage_def: &def.stages["review"],
+        payload: &state.payload,
+        input: None,
+        resume: None,
+        branch: None,
+    };
+    let prepared = engine.prepare_turn(&entry).await?;
+    if let Some(sql) = between {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&engine.pool)
+            .await?;
+    }
+    engine.launch_turn(prepared, None, None).await
+}
+
+/// What a refused launch must leave exactly as it found it.
+async fn untouched(pool: &SqlitePool, task_id: &str) -> (Value, Value, String, usize, usize) {
+    let state = state_of(pool, task_id).await;
+    (
+        state.payload,
+        state.loop_counters,
+        state.current_stage,
+        sessions::list_for_task(pool, task_id).await.unwrap().len(),
+        stage_results(pool, task_id).await.len(),
+    )
+}
+
+#[tokio::test]
+async fn a_launch_whose_workflow_state_was_deleted_after_preparation_is_refused() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = flow_in(&dir);
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let task_id = seed_task(&pool, &def.name).await;
+    seed_review_state(&pool, &task_id).await;
+
+    let delete = format!("DELETE FROM workflow_state WHERE task_id = '{task_id}'");
+    let err = launch_review(&engine, &def, &task_id, Some(&delete))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NoWorkflowState), "{err:?}");
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an agent was started for a task with no state"
+    );
+    assert!(
+        workflow_state::get(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_clear_reaches_the_caller_and_changes_nothing() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = flow_in(&dir);
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let task_id = seed_task(&pool, &def.name).await;
+    seed_review_state(&pool, &task_id).await;
+    fail_the_capture_clear(&pool).await;
+    let before = untouched(&pool, &task_id).await;
+
+    let err = launch_review(&engine, &def, &task_id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Db(_)) && err.to_string().contains("injected clear failure"),
+        "{err:?}"
+    );
+    let after = untouched(&pool, &task_id).await;
+    assert_eq!(after, before);
+    assert_eq!(after.0["stages"]["review"]["summary"], json!(OLD));
+    assert_eq!(after.0["current_result_id"], json!("result-pointer"));
+    assert_eq!(after.3, 0, "an agent was started");
+}
+
+#[tokio::test]
+async fn a_prompt_that_cannot_render_keeps_the_previous_capture() {
+    for (what, prompt) in [
+        ("a missing prompt file", None),
+        ("a malformed placeholder", Some("verdict: {{ stages.review")),
+    ] {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = flow_in(&dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let task_id = seed_task(&pool, &def.name).await;
+        seed_review_state(&pool, &task_id).await;
+        match prompt {
+            None => fs::remove_file(dir.join("review-turn.md")).unwrap(),
+            Some(text) => fs::write(dir.join("review-turn.md"), text).unwrap(),
+        }
+        let before = untouched(&pool, &task_id).await;
+
+        let err = launch_review(&engine, &def, &task_id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Io(_) | EngineError::Template { .. }),
+            "{what}: {err:?}"
+        );
+        let after = untouched(&pool, &task_id).await;
+        assert_eq!(after, before, "{what}");
+        assert_eq!(after.0["stages"]["review"]["summary"], json!(OLD), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_baseline_that_cannot_be_taken_keeps_the_previous_capture() {
+    // A read-only role's baseline is taken before the clear. Its worktree is
+    // gone, so it cannot be taken.
+    let run = start_read_only_task("reviewer", false, json!({}), ro_steps(&[])).await;
+    wait_until_stage(&run.pool, &run.task_id, "verified").await;
+    let state = state_of(&run.pool, &run.task_id).await;
+    let mut payload = state.payload.clone();
+    payload["stages"] = json!({"review": {"outcome": "done", "summary": OLD}});
+    workflow_state::update(
+        &run.pool,
+        &run.task_id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: "review".to_string(),
+            stage_kind: "agent_turn".to_string(),
+            loop_counters: state.loop_counters,
+            payload,
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    fs::remove_dir_all(&run.worktree_dir).unwrap();
+    let before = untouched(&run.pool, &run.task_id).await;
+
+    let err = launch_review(&run._engine, &run.def, &run.task_id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::Worktree(_) | EngineError::ReadOnlyBaseline { .. }
+        ),
+        "{err:?}"
+    );
+    let after = untouched(&run.pool, &run.task_id).await;
+    assert_eq!(after, before);
+    assert_eq!(after.0["stages"]["review"]["summary"], json!(OLD));
+}
+
+#[tokio::test]
+async fn a_launch_that_fails_after_the_clear_leaves_it_cleared_and_a_fresh_retry_starts() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = flow_in(&dir);
+    let binary = named_script_binary(
+        &dir,
+        "fake-claude-insert-fails",
+        json!({"by_prompt": {
+            first_entry_marker(): [
+                {"op": "echo_turn"},
+                {"op": "report", "outcome": "again", "summary": OLD},
+                {"op": "result"},
+            ],
+        }}),
+    );
+    // The first `review` session is fine; the second one's row cannot be
+    // written, after the previous capture has been cleared.
+    sqlx::query(
+        "CREATE TRIGGER no_second_review BEFORE INSERT ON sessions
+         WHEN NEW.stage = 'review' AND EXISTS (SELECT 1 FROM sessions WHERE stage = 'review')
+         BEGIN SELECT RAISE(ABORT, 'injected session failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    let task_id = seed_task(&pool, &def.name).await;
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert!(
+        task.stuck_reason
+            .unwrap()
+            .contains("injected session failure"),
+        "the session insert was not what failed"
+    );
+    assert_eq!(review_runs(&pool, &task_id).await.len(), 1);
+    let stuck = state_of(&pool, &task_id).await;
+    assert!(
+        live_review(&stuck.payload).is_none(),
+        "the capture was not cleared before the failed launch: {:?}",
+        live_review(&stuck.payload)
+    );
+    assert_eq!(stuck.payload["stages"]["plan"], json!("HANDOFF-FROM-PLAN"));
+    let applied = stage_results(&pool, &task_id).await;
+    assert_eq!(applied.len(), 2);
+
+    // The fault clears and the task is retried from scratch: the attempt
+    // starts, its prompt lacks the old own-text (the accepted limitation) and
+    // keeps the rest.
+    sqlx::query("DROP TRIGGER no_second_review")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let binary = named_script_binary(
+        &dir,
+        "fake-claude-after-insert-fails",
+        json!([{"op": "echo_turn"}, {"op": "wait_file", "path": dir.join("never")}]),
+    );
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    let outcome = engine.retry_task(&task_id, RetryMode::Fresh).await.unwrap();
+    assert!(!outcome.resumed);
+    let runs = wait_for_review_runs(&pool, &task_id, 2).await;
+    let fresh = runs.iter().max_by_key(|s| s.started_at).unwrap();
+    let delivered = delivered_to(&pool, &fresh.id).await;
+    assert!(delivered.contains("Earlier verdict: []"), "{delivered}");
+    assert!(delivered.contains("HANDOFF-FROM-PLAN"), "{delivered}");
+    assert_eq!(stage_results(&pool, &task_id).await.len(), applied.len());
+}
+
+#[tokio::test]
+async fn a_launch_dropped_while_clearing_commits_nothing_and_the_next_one_starts() {
+    let dir = tempdir();
+    let db_path = dir.join("abandon.db");
+    let pool = crate::db::connect(&db_path).await.unwrap();
+    let def = flow_in(&dir);
+    let binary = named_script_binary(
+        &dir,
+        "fake-claude-after-abandon",
+        json!([
+            {"op": "echo_turn"},
+            {"op": "report", "outcome": "done", "summary": NEW},
+            {"op": "result"},
+        ]),
+    );
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    let task_id = seed_task(&pool, &def.name).await;
+    seed_review_state(&pool, &task_id).await;
+    let before = untouched(&pool, &task_id).await;
+
+    // Another connection holds the database's write lock, so the launch's
+    // clearing write has to wait for it.
+    let observer = crate::db::connect(&db_path).await.unwrap();
+    let mut writer = observer.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+    // The slot is taken exactly as the production caller takes it, and goes
+    // with the dropped launch.
+    let spec = TurnSpec {
+        stage: "review",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = engine.turn_gate().claim(&task_id, &spec).await.unwrap() else {
+        panic!("the slot was free");
+    };
+    assert_eq!(engine.running_total(), 1);
+    let launch = {
+        let engine = Arc::clone(&engine);
+        let def = Arc::clone(&def);
+        let task_id = task_id.clone();
+        tokio::spawn(async move {
+            let state = workflow_state::get(&engine.pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let entry = StageEntry {
+                task_id: &task_id,
+                definition: &def,
+                stage_name: "review",
+                stage_def: &def.stages["review"],
+                payload: &state.payload,
+                input: None,
+                resume: None,
+                branch: None,
+            };
+            let prepared = engine.prepare_turn(&entry).await.unwrap();
+            engine.launch_turn(prepared, Some(permit), None).await
+        })
+    };
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+    assert!(
+        !launch.is_finished(),
+        "the launch did not wait for the write lock"
+    );
+    launch.abort();
+    assert!(launch.await.unwrap_err().is_cancelled());
+
+    // Whatever the aborted write was, it did not commit: another connection
+    // sees the state exactly as it was, no session, no result.
+    sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+    drop(writer);
+    assert_eq!(untouched(&observer, &task_id).await, before);
+    assert_eq!(
+        engine.running_total(),
+        0,
+        "the dropped launch kept its slot"
+    );
+
+    // The lock, the slot and the connection are all reusable: the same turn
+    // launches, clears the capture and runs to its end.
+    let Claim::Start(permit) = engine.turn_gate().claim(&task_id, &spec).await.unwrap() else {
+        panic!("the slot was not freed");
+    };
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    let entry = StageEntry {
+        task_id: &task_id,
+        definition: &def,
+        stage_name: "review",
+        stage_def: &def.stages["review"],
+        payload: &state.payload,
+        input: None,
+        resume: None,
+        branch: None,
+    };
+    let prepared = engine.prepare_turn(&entry).await.unwrap();
+    let session_id = engine
+        .launch_turn(prepared, Some(permit), None)
+        .await
+        .unwrap();
+    let delivered = delivered_to(&pool, &session_id).await;
+    assert!(delivered.contains(OLD), "{delivered}");
+    wait_until_task_status(&pool, &task_id, "closed").await;
+    let done = state_of(&observer, &task_id).await;
+    assert_eq!(done.payload["stages"]["review"]["summary"], json!(NEW));
+}
+
+#[tokio::test]
+async fn a_legacy_row_without_a_stage_kind_gets_it_filled_in_by_the_clear() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = flow_in(&dir);
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    let task_id = seed_task(&pool, &def.name).await;
+    seed_review_state(&pool, &task_id).await;
+    sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state_of(&pool, &task_id).await.stage_kind, None);
+
+    engine
+        .clear_stage_capture(&task_id, &def, "review")
+        .await
+        .unwrap();
+    let after = state_of(&pool, &task_id).await;
+    assert_eq!(after.stage_kind.as_deref(), Some("agent_turn"));
+    assert!(live_review(&after.payload).is_none());
+    assert_eq!(after.payload["stages"]["plan"], json!("HANDOFF-FROM-PLAN"));
+    assert_eq!(after.current_stage, "review");
+}
+
+#[tokio::test]
+async fn a_legacy_row_in_an_unknown_stage_is_refused_and_keeps_its_capture() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = flow_in(&dir);
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    let task_id = seed_task(&pool, &def.name).await;
+    seed_review_state(&pool, &task_id).await;
+    sqlx::query(
+        "UPDATE workflow_state SET stage_kind = NULL, current_stage = 'ghost' WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = state_of(&pool, &task_id).await;
+
+    let err = engine
+        .clear_stage_capture(&task_id, &def, "review")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::UnknownStage(s) if s == "ghost"),
+        "{err:?}"
+    );
+    let after = state_of(&pool, &task_id).await;
+    assert_eq!(after.payload, before.payload);
+    assert_eq!(after.stage_kind, None);
+}
+
+// ---- lifecycle -------------------------------------------------------------
+
+/// The planned workflow's loop, with the real `planner-turn.md` as the prompt:
+/// `spec_check` asks, a human answers, `spec_check` runs again and reads its
+/// own previous report back.
+const PLANNED: &str = r#"name: planned-flow
+roles:
+  planner:
+    cli: claude
+    model: sonnet
+stages:
+  spec_check:
+    kind: agent_turn
+    role: planner
+    prompt_file: planner-turn.md
+    capture: json
+    on: { ready: finished, needs_input: spec_questions }
+  spec_questions:
+    kind: human_gate
+    capture: text
+    on: { resumed: spec_check }
+  finished:
+    kind: terminal
+"#;
+
+const DRAFT: &str = "DRAFT-SPEC-MARK checks and questions\n- question one\n- question two\n";
+const ANSWER: &str = "HUMAN-ANSWER-MARK take option B";
+const FINAL_SPEC: &str = "FINAL-SPEC-MARK the folded-in spec\n";
+
+#[tokio::test]
+async fn the_planner_rerun_reads_its_previous_report_then_shows_none_until_it_reports() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    fs::write(
+        dir.join("planner-turn.md"),
+        include_str!("../../../../workflows/prompts/planner-turn.md"),
+    )
+    .unwrap();
+    fs::write(dir.join("planned-flow.yaml"), PLANNED).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(PLANNED, &dir).unwrap());
+    let hold = dir.join("hold-planner");
+    let binary = named_script_binary(
+        &dir,
+        "fake-claude-planner",
+        json!({"by_prompt": {
+            "HUMAN-ANSWER-MARK": [
+                {"op": "echo_turn"},
+                {"op": "wait_file", "path": hold},
+                {"op": "usage_limit"},
+            ],
+            "Task:": [
+                {"op": "echo_turn"},
+                {"op": "report", "outcome": "needs_input", "summary": DRAFT},
+                {"op": "result"},
+            ],
+        }}),
+    );
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    let task_id = seed_task(&pool, &def.name).await;
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "spec_questions").await;
+    let asked = state_of(&pool, &task_id).await;
+    assert_eq!(
+        asked.payload["stages"]["spec_check"]["summary"],
+        json!(DRAFT)
+    );
+    let applied_before: Vec<String> = stage_results(&pool, &task_id)
+        .await
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(applied_before.len(), 1, "spec_check → spec_questions");
+
+    engine
+        .send_message_or_resume(&task_id, ANSWER)
+        .await
+        .unwrap();
+    let second = crate::test_support::wait_until("the second planner run", || async {
+        let runs = runs_for_stage(&pool, &task_id, "spec_check").await;
+        if runs.len() == 2 {
+            Ok(runs.into_iter().max_by_key(|s| s.started_at).unwrap())
+        } else {
+            Err(format!("{} runs", runs.len() + 1))
+        }
+    })
+    .await;
+
+    // The real prompt carried the previous report and the answer to the new
+    // attempt; the live copy of that report is already gone.
+    let delivered = delivered_to(&pool, &second.id).await;
+    assert!(delivered.contains(DRAFT), "{delivered}");
+    assert!(delivered.contains(ANSWER), "{delivered}");
+    let held = state_of(&pool, &task_id).await;
+    assert!(
+        held.payload["stages"].get("spec_check").is_none(),
+        "the previous report is shown as live: {:?}",
+        held.payload["stages"]
+    );
+    assert_eq!(held.payload["stages"]["spec_questions"], json!(ANSWER));
+    let applied_held: Vec<String> = stage_results(&pool, &task_id)
+        .await
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(
+        applied_held.len(),
+        2,
+        "the gate's answer is the second result"
+    );
+    assert_eq!(held.payload["current_result_id"], json!(applied_held[1]));
+
+    // The interrupted attempt keeps it absent; the previous report is still
+    // the applied result of its own departure.
+    release(&hold);
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let stuck = state_of(&pool, &task_id).await;
+    assert!(stuck.payload["stages"].get("spec_check").is_none());
+    let old_result = AppliedStageResult::from_event(
+        stage_results(&pool, &task_id)
+            .await
+            .iter()
+            .find(|e| e.payload["source_stage"] == "spec_check")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(old_result.capture["summary"], json!(DRAFT));
+
+    // Resumed, it reports the folded-in spec. Both texts are then readable by
+    // the identity they were recorded under, and the new one is chained to the
+    // old history.
+    let binary = named_script_binary(
+        &dir,
+        "fake-claude-planner-resumed",
+        json!([
+            {"op": "echo_turn"},
+            {"op": "report", "outcome": "ready", "summary": FINAL_SPEC},
+            {"op": "result"},
+        ]),
+    );
+    let engine2 = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    engine2.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "closed").await;
+    let done = state_of(&pool, &task_id).await;
+    assert_eq!(
+        done.payload["stages"]["spec_check"]["summary"],
+        json!(FINAL_SPEC)
+    );
+    let results = stage_results(&pool, &task_id).await;
+    let new_result = AppliedStageResult::from_event(results.last().unwrap()).unwrap();
+    assert_eq!(new_result.outcome, "ready");
+    assert_eq!(
+        new_result.previous_result_id.as_deref(),
+        applied_held.last().map(String::as_str)
+    );
+    for (id, text) in [
+        (&old_result.result_id, DRAFT),
+        (&new_result.result_id, FINAL_SPEC),
+    ] {
+        let by_id = context::lookup(
+            &pool,
+            &task_id,
+            &ContextRequest::StageById {
+                result_id: id.clone(),
+                anchor_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let Lookup::Found(ContextResponse::StageResult { result, .. }) = by_id else {
+            panic!("{id} is not readable: {by_id:?}");
+        };
+        assert_eq!(result.capture["summary"], json!(text));
+    }
+}
+
+#[tokio::test]
+async fn a_restart_sweep_of_a_launched_interrupted_attempt_keeps_the_capture_absent() {
+    let (flow, hold, _engine) = held_second_review().await;
+    release(&hold);
+    wait_until_task_status(&flow.pool, &flow.task_id, "stuck").await;
+    // Put the task back as a daemon crash would have left it: open, with the
+    // attempt's session gone.
+    sqlx::query("UPDATE tasks SET status = 'open', stuck_reason = NULL WHERE id = ?")
+        .bind(&flow.task_id)
+        .execute(&flow.pool)
+        .await
+        .unwrap();
+    let hold2 = flow.dir.join("hold-after-sweep");
+    let binary = named_script_binary(
+        &flow.dir,
+        "fake-claude-after-sweep",
+        json!([
+            {"op": "echo_turn"},
+            {"op": "wait_file", "path": hold2},
+            {"op": "report", "outcome": "done", "summary": NEW},
+            {"op": "result"},
+        ]),
+    );
+    let restarted = engine_with_adapter_and_workflows_dir(flow.pool.clone(), &binary, &flow.dir);
+    let parked = restarted.park_interrupted_turns().await.unwrap();
+    assert_eq!(parked.agent_turns, 1, "{parked:?}");
+    wait_until_task_status(&flow.pool, &flow.task_id, "stuck").await;
+    let swept = state_of(&flow.pool, &flow.task_id).await;
+    assert!(
+        live_review(&swept.payload).is_none(),
+        "the sweep restored a capture: {:?}",
+        live_review(&swept.payload)
+    );
+    let applied_before = stage_results(&flow.pool, &flow.task_id).await.len();
+
+    restarted
+        .retry_task(&flow.task_id, RetryMode::Fresh)
+        .await
+        .unwrap();
+    let runs = wait_for_review_runs(&flow.pool, &flow.task_id, 3).await;
+    assert!(runs.iter().all(|r| r.resumed_from.is_none()));
+    let during = state_of(&flow.pool, &flow.task_id).await;
+    assert!(
+        live_review(&during.payload).is_none(),
+        "{:?}",
+        during.payload
+    );
+    assert_eq!(
+        stage_results(&flow.pool, &flow.task_id).await.len(),
+        applied_before
+    );
+    release(&hold2);
+    wait_until_task_status(&flow.pool, &flow.task_id, "closed").await;
+    let done = state_of(&flow.pool, &flow.task_id).await;
+    assert_eq!(done.payload["stages"]["review"]["summary"], json!(NEW));
 }

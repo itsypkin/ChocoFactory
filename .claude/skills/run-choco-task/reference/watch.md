@@ -49,32 +49,42 @@ The text a finished lap of `spec_check` or `internal_review` left:
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.internal_review.summary'
 ```
 
-**This is the stage's live text, and it is empty while a new lap runs.** The
-daemon removes a stage's previous text at the moment it starts a new attempt
-of that stage (running, interrupted by a usage limit, stuck): the new attempt
-has not produced a verdict yet, so `jq` prints `null` or nothing. Empty is
-neither approval nor rejection, and the previous lap's text is not the new
-lap's. Read an empty result as "no verdict from this attempt", and look at the
-task's status and `stuck_reason` for what happened to it. The one case where
-old text can still show is a turn that has not started: it is queued for a
-free agent slot or held by a pause, or it failed before launch (its prompt
-would not render, for example). That text is the previous run's, and no new
-agent has run for that pending entry.
+**This is the stage's live text, and it is empty while a new lap of an agent
+turn runs.** The daemon removes an agent-turn stage's previous text at the
+moment it launches a new attempt of that stage (running, interrupted by a usage
+limit, stuck): the new attempt has not produced a verdict yet, so `jq` prints
+`null` or nothing. Empty is neither approval nor rejection, and the previous
+lap's text is not the new lap's. Read an empty result as "no verdict from this
+attempt", and look at the task's status and `stuck_reason` for what happened to
+it. The old text can still show **before** the attempt launches: while the turn
+is queued for a free agent slot or held by a pause, or when it failed before
+the agent started (its prompt would not render, or the write that clears the
+text failed). That text is the previous run's, and no new agent has run for it.
+Shell, poll and human-gate stages do not launch an agent turn, so they keep
+their last text until they finish again.
 
 ### Reading an earlier applied verdict
 
 An earlier lap's verdict is kept in the task's recorded history, not in the
 live text above. The daemon records a stage result each time a task leaves a
 stage, and `choco` has no command to read it, so ask the daemon's HTTP API.
-First find the daemon `choco` talks to (the order is in
+Use the daemon address that `choco` itself uses for this task: the URL you
+pass as `--base-url` (or set in `CHOCO_BASE_URL`), if you pass one. Otherwise
+`choco` reads the running daemon's port from its lock file, and `choco server
+status` does the same and fails when no daemon is running (the order is in
 [docs/cli.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/cli.md#which-daemon-choco-talks-to-the-base-url)):
 
 ```sh
-DAEMON=${CHOCO_BASE_URL:-http://127.0.0.1:$(jq -r .port ~/.config/chocofactory/chocofactoryd.lock)}
+# With an explicit URL, set DAEMON to that same URL. Without one:
+DAEMON=http://127.0.0.1:$(choco --json server status | jq -er '.daemon.port') \
+  || { echo "no running daemon: start it with 'choco server start'" >&2; false; }
 ID=<complete task id>
 curl --silent --show-error --get "$DAEMON/tasks/$ID/context" \
   --data-urlencode 'source=stage' --data-urlencode 'stage=internal_review'
 ```
+
+If `choco server status` prints `"running":false` (exit 3) or the `jq` step
+fails, stop: there is no daemon to ask, and `:4141` is not a safe guess.
 
 The answer's `provenance` says what it is. `stage_result` is a recorded
 departure from that stage: its `result.result_id`, `outcome` and
@@ -93,13 +103,18 @@ never-recorded history; it does not say the stage never ran or approved.
 History is pruned with the other events and not back-filled, so an old task may
 have none. See [docs/context.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/context.md).
 
-The coder's stages keep their report too. Its latest one is `revising`'s if that
-stage has run and `coding`'s otherwise; when the task is parked at `blocker`,
-it is the reason:
+The coder's stages keep their report too. When the task is parked at `blocker`,
+the report that holds the reason is `revising`'s if that stage ran and
+`coding`'s otherwise:
 
 ```bash
 choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'
 ```
+
+Use it only for a task parked at `blocker`. While a revise lap runs, `revising`
+is empty and this prints the first `coding` report, not the latest one; that
+report is read from the recorded history with `stage=revising` (see
+[above](#reading-an-earlier-applied-verdict)).
 
 `scripts/tail-events.sh` cuts each event to one line, so it can't show
 reasons. Every report an agent made is in the events, applied or not. A report is a `tool_call` event

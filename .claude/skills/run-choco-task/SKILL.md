@@ -306,13 +306,18 @@ choco task create --project <p> --workflow coding-task-planned \
   [reference/watch.md](reference/watch.md#stage-times).
 - **Read a stage's verdict text** with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
-  for `spec_check` or `internal_review`. It is empty while a new lap of that
-  stage runs or is stuck, and empty is neither approval nor rejection; an
-  earlier lap's applied verdict is read from the task's recorded history
-  (see [reference/watch.md](reference/watch.md#reading-an-earlier-applied-verdict)).
-  For the coder's latest report, which
-  holds the reason when it stopped at `blocker`, use
-  `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`.
+  for `spec_check` or `internal_review`. It is empty while a launched new lap
+  of that stage runs, is interrupted or is stuck, and empty is neither approval
+  nor rejection. (Before the agent launches, while the turn is queued, held by
+  a pause, or failed before it started, the previous run's text can still
+  show.) An earlier lap's applied verdict is read from the task's recorded
+  history (see
+  [reference/watch.md](reference/watch.md#reading-an-earlier-applied-verdict)).
+  For the coder's report when the task is parked at `blocker`, which holds the
+  reason it stopped, use
+  `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`
+  (only while parked at `blocker`; during a revise lap it is the first coding
+  report, so read the latest from the history).
   The description the writer wrote is `.workflow_state.payload.stages.describe_pr.summary`.
   While the task is open, the coder's work report (what the reviewer checks
   and the writer reads) is in the worktree's private git directory, never

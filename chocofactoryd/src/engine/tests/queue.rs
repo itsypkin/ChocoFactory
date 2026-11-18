@@ -3283,6 +3283,17 @@ async fn a_paused_tasks_queued_row_costs_the_dispatcher_one_pass_per_tick() {
 // only then be cleared.
 #[tokio::test]
 async fn queued_admission_renders_old_self_capture_then_clears() {
+    queued_admission_with_old_capture(false).await;
+}
+
+// The same, for a queued turn whose task is paused when its slot frees: it is
+// held, untouched, and only the admission after the resume sends and clears.
+#[tokio::test]
+async fn a_held_queued_turn_keeps_its_old_capture_until_it_is_admitted() {
+    queued_admission_with_old_capture(true).await;
+}
+
+async fn queued_admission_with_old_capture(pause_first: bool) {
     let q = Q::new(Some(1)).await;
     fs::write(
         &q.flow,
@@ -3323,7 +3334,7 @@ async fn queued_admission_renders_old_self_capture_then_clears() {
         .unwrap()
         .extend(["job-a".to_string(), "job-b".to_string()]);
 
-    q.create("job-a").await;
+    let a = q.create("job-a").await;
     q.wait_started("job-a").await;
     let b = q.create("job-b").await;
     q.wait_rows(1).await;
@@ -3356,7 +3367,20 @@ async fn queued_admission_renders_old_self_capture_then_clears() {
     assert!(q.sessions(&b.id).await.is_empty());
     assert_eq!(payload_of(&q.pool, &b.id).await, payload);
 
+    if pause_first {
+        q.engine.pause_task(&b.id, false).await.unwrap();
+    }
     q.release("job-a");
+    if pause_first {
+        // The slot is free and the row is still queued: held, not started,
+        // with the previous capture exactly as it was.
+        q.wait_session_final(&a.id).await;
+        q.assert_not_started("job-b").await;
+        assert!(q.sessions(&b.id).await.is_empty());
+        assert_eq!(payload_of(&q.pool, &b.id).await, payload);
+        assert_eq!(q.rows().await.len(), 1);
+        q.engine.resume_task(&b.id).await.unwrap();
+    }
     q.wait_started("job-b").await;
     let session = q.sessions(&b.id).await.remove(0);
     let delivered = super::stale_capture::delivered_to(&q.pool, &session.id).await;

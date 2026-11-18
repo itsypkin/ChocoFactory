@@ -443,8 +443,10 @@ impl WorkflowEngine {
     /// turn was prepared from: parallel branches are prepared from one shared
     /// payload, and writing that back would restore a capture an earlier
     /// branch launch had just cleared. The caller holds the task's lock, so
-    /// the read and the write cannot interleave with another writer. Nothing
-    /// but `payload` changes (`enters_stage` is false), and nothing is
+    /// the read and the write cannot interleave with another writer. Only
+    /// `payload` changes (`enters_stage` is false, so `stage_entered_at` and
+    /// the stage are kept), though `update` also stamps `updated_at` and writes
+    /// `stage_kind`, filled from the definition for a row that has none. Nothing is
     /// written when there is no entry to remove. No applied result is
     /// recorded or moved: those live in the stage-result history, not here.
     pub(super) async fn clear_stage_capture(

@@ -392,10 +392,12 @@ pub(super) fn capture_label(capture: Option<Capture>) -> Value {
 ///
 /// Re-entering a stage overwrites its previous capture: the value means
 /// "what this stage produced most recently", which is what a later stage
-/// templating it wants. While a new attempt of the stage runs, interrupted or
-/// stuck, there is no such value: `launch_turn` removes the previous one once
-/// the attempt's prompt has been rendered, so it is never shown as the new
-/// attempt's result. The stage trail on the events timeline is what
+/// templating it wants. While a launched new attempt of an agent-turn stage runs,
+/// is interrupted or stuck, there is no such value: `launch_turn` removes the
+/// previous one once the attempt's prompt has been rendered, so it is never
+/// shown as the new attempt's result. Until it launches (queued, held, or a
+/// failure before the agent starts) the previous one is still here, and a
+/// shell, poll or human-gate stage is never cleared. The stage trail on the events timeline is what
 /// records that it ran more than once.
 pub(super) fn merge_stage_capture(payload: &mut Value, stage: &str, value: Value) {
     // A payload that isn't an object (hand-edited row, or a shape some
