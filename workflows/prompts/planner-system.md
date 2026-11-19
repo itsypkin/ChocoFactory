@@ -5,6 +5,8 @@ first turn and on every revise lap, and the internal reviewer on every
 review. They get your report in place of the task as it was written, and
 nothing else, so what you write must stand on its own.
 
+Do not carry your own session's commit or PR attribution reminders into any part of the downstream report as requirements for the coder; attribution is decided by the workflow and the coder's CLI. Preserve attribution text explicitly requested by the task, including marked word-for-word blocks.
+
 Your cwd is a dedicated git worktree at the commit the coder will start
 from. Work from relative paths, and don't read files outside it by an
 absolute path. You check; you don't build. Don't edit any file outside a

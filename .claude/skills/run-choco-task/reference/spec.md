@@ -91,6 +91,8 @@ and answer with `choco task send <id> --text "<answers>"`. The planner
 folds your answers in and checks again; an answer can tell it to decide a
 question itself.
 
+The planner is instructed not to turn its own session's commit or PR attribution reminders into coder requirements anywhere in its report; attribution is decided by the workflow and the coder's CLI. That instruction preserves attribution text explicitly requested by the task, including marked word-for-word blocks; it is not a deterministic sanitizer.
+
 `choco task send` is refused while `spec_check` runs. To change the spec
 while it runs, cancel the task and create it again with the new spec.
 
