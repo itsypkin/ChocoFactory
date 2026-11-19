@@ -506,7 +506,7 @@ A paused task has its own status, and so does the stretch before it:
 
 | Status | Means |
 |---|---|
-| `pausing` | The pause was asked for, and an agent turn or shell command the task had already started is still running. |
+| `pausing` | The pause was asked for and has not yet settled to `paused`. An agent turn or shell command the task had already started may still be finishing, or its result may still be applied. |
 | `paused` | The pause was asked for, nothing of the task's is running, and every finished turn's result is applied. |
 
 `choco task status` shows a `Paused` line: `since 14:05 — choco task resume

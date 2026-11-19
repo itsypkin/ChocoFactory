@@ -330,7 +330,7 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
 fn stage_cell(t: &TaskSummary) -> String {
     let base = base_stage_cell(t);
     match t.task.status.as_str() {
-        // The turn that was running is still finishing.
+        // A pause was asked for and has not yet settled to `paused`.
         "pausing" => format!("{base} · pausing"),
         _ => base,
     }

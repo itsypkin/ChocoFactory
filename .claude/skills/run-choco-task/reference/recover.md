@@ -341,8 +341,9 @@ The other options cost more:
 the machine for a while or to stop one task while another finishes. The task
 has two statuses on the way:
 
-- `pausing`: the pause was asked for, and an agent turn or shell command the
-  task had already started is still running. It shows a `Paused` line,
+- `pausing`: the pause was asked for and has not yet settled to `paused`. An
+  agent turn or shell command the task had already started may still be
+  finishing, or its result may still be applied. It shows a `Paused` line,
   `waiting for <stage>'s turn to finish`.
 - `paused`: nothing of the task's is running and every finished turn's
   result is applied. The line reads
