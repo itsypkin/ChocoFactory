@@ -105,12 +105,13 @@ After that you only create tasks. Create one as in [How it is used](#how-it-is-u
 
 ![The choco dashboard: one task needs you, two are in progress, none are stuck, and ten closed recently](docs/images/dashboard.png)
 
-Its four sections:
+Its five sections:
 
 | Section | Holds |
 |---|---|
 | Needs you | tasks waiting at a human gate, such as your PR verdict |
-| In progress | every other open task |
+| In progress | every other open task, and one that is pausing (a pause was asked for, but the task is not yet reported paused) |
+| Paused | tasks paused and settled; "paused for" counts from when the pause was asked for |
 | Stuck | tasks the engine could not move forward, with the reason |
 | Recently closed | the latest finished and cancelled tasks |
 

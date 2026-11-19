@@ -341,8 +341,9 @@ The other options cost more:
 the machine for a while or to stop one task while another finishes. The task
 has two statuses on the way:
 
-- `pausing`: the pause was asked for, and an agent turn or shell command the
-  task had already started is still running. It shows a `Paused` line,
+- `pausing`: the pause was asked for and has not yet settled to `paused`. An
+  agent turn or shell command the task had already started may still be
+  finishing, or its result may still be applied. It shows a `Paused` line,
   `waiting for <stage>'s turn to finish`.
 - `paused`: nothing of the task's is running and every finished turn's
   result is applied. The line reads
@@ -372,6 +373,12 @@ started. A daemon restart keeps a paused task paused, except one whose turn
 had failed unapplied: that task is `stuck`.
 A turn that fails while the task is `pausing` makes it `stuck`, and
 `choco task cancel` works from either status.
+
+In `choco dashboard` a `pausing` task stays under IN PROGRESS, with its time
+in stage (and `· pausing` after the stage where the column fits); it moves to
+PAUSED only once its status is `paused`. The PAUSED "paused for" time counts
+from when the pause was asked for, so it includes the time the finishing turn
+took.
 
 To wait for a pause: `choco task status <id> --until paused`. Any other
 `--until` target ends with exit 7 when the task pauses, and `--until attention`

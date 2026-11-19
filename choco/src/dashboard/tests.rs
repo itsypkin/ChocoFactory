@@ -4615,10 +4615,14 @@ fn every_listed_status_lands_in_exactly_one_section() {
     use chocofactory_core::models::ALL_TASK_STATUSES;
     let mut app = new_app(Scope::AllProjects);
     let make = |status: &str| paused_summary(&format!("t-{status}"), status, 5);
-    let active: Vec<TaskSummary> = ["open", "pausing", "paused", "stuck"]
-        .into_iter()
-        .map(make)
-        .collect();
+    let active: Vec<TaskSummary> = [
+        make("open"),
+        waiting(paused_summary("t-open-waiting", "open", 5)),
+        make("pausing"),
+        make("paused"),
+        make("stuck"),
+    ]
+    .into();
     let closed: Vec<TaskSummary> = ["closed", "cancelled"].into_iter().map(make).collect();
     load(&mut app, active, closed);
     let sections = app.sections();
@@ -4632,6 +4636,13 @@ fn every_listed_status_lands_in_exactly_one_section() {
             .collect();
         assert_eq!(homes.len(), 1, "'{status}' is in sections {homes:?}");
     }
+    // Every entry of every section, counted: no id is listed twice.
+    let all: Vec<String> = sections.iter().flat_map(|s| ids(s)).collect();
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(all.len(), 7, "{all:?}");
+    assert_eq!(sorted.len(), 7, "an id is listed twice: {all:?}");
     let names: Vec<&str> = Section::ALL.iter().map(|s| s.title()).collect();
     assert_eq!(
         names,
@@ -4643,30 +4654,461 @@ fn every_listed_status_lands_in_exactly_one_section() {
             "RECENTLY CLOSED"
         ]
     );
-    // Pausing and paused tasks share the Paused section, between In
-    // progress and Stuck.
+    // A pausing task is still in progress; only a paused one is in Paused.
+    assert_eq!(ids(&sections[0]), ["t-open-waiting"].map(String::from));
     assert_eq!(
-        ids(&sections[2]),
-        ["t-paused", "t-pausing"].map(String::from)
+        ids(&sections[1]),
+        ["t-open", "t-pausing"].map(String::from),
+        "a pausing task left IN PROGRESS"
     );
-    assert_eq!(ids(&sections[1]), ["t-open"].map(String::from));
+    assert_eq!(ids(&sections[2]), ["t-paused"].map(String::from));
+    assert_eq!(ids(&sections[3]), ["t-stuck"].map(String::from));
+    assert_eq!(
+        ids(&sections[4]),
+        ["t-closed", "t-cancelled"].map(String::from)
+    );
+}
+
+// ---- pausing stays in progress (#389) ----------------------------------------
+
+/// Where one task row sits in a rendered frame: the section whose header is
+/// the nearest one above it, the whole row line, and the cell under that
+/// section's time heading (`None` when the heading is not drawn).
+struct Located {
+    section: Section,
+    row: String,
+    time: Option<String>,
+}
+
+fn time_label(section: Section) -> &'static str {
+    match section {
+        Section::NeedsYou => "waiting",
+        Section::InProgress => "in stage",
+        Section::Paused => "paused for",
+        Section::Stuck => "stuck for",
+        Section::Closed => "closed",
+    }
+}
+
+/// Finds the one row whose displayed id is `id8`. Panics when it is drawn
+/// twice. `None` when it is not on the frame, or no header is above it.
+fn locate(frame: &str, id8: &str) -> Option<Located> {
+    let mut header: Option<(Section, String)> = None;
+    let mut found: Option<Located> = None;
+    for line in frame.lines() {
+        if let Some(sec) = Section::ALL
+            .into_iter()
+            .find(|s| line.starts_with(&format!("{} (", s.title())))
+        {
+            header = Some((sec, line.to_string()));
+            continue;
+        }
+        let cells: String = line.chars().skip(2).take(8).collect();
+        if cells != id8 {
+            continue;
+        }
+        let (section, head) = header.clone()?;
+        let time = head.find(time_label(section)).map(|b| {
+            let x = head[..b].chars().count();
+            line.chars()
+                .skip(x)
+                .take_while(|c| !c.is_whitespace())
+                .collect::<String>()
+        });
+        assert!(found.is_none(), "{id8} is drawn twice:\n{frame}");
+        found = Some(Located {
+            section,
+            row: line.to_string(),
+            time,
+        });
+    }
+    found
+}
+
+fn at_coding(
+    id: &str,
+    title: &str,
+    status: &str,
+    stage_mins: Option<i64>,
+    request_mins: Option<i64>,
+    updated_mins: i64,
+) -> TaskSummary {
+    let mut t = summary(id, title, status, Some("coding"), stage_mins, "p");
+    t.task.paused_at = request_mins.map(mins_ago);
+    t.task.updated_at = mins_ago(updated_mins);
+    t
+}
+
+/// A pausing task, 30m in its stage, the pause asked for 2m ago.
+fn pausing_task(id: &str, title: &str) -> TaskSummary {
+    at_coding(id, title, "pausing", Some(30), Some(2), 11)
+}
+
+/// A settled paused task, 30m in its stage, the pause asked for 7m ago.
+fn paused_task(id: &str, title: &str) -> TaskSummary {
+    at_coding(id, title, "paused", Some(30), Some(7), 13)
 }
 
 #[test]
-fn the_paused_section_reads_paused_for_and_marks_a_pausing_stage() {
+fn pausing_rows_stay_in_progress_with_stage_age_and_suffix() {
     let mut app = new_app(Scope::AllProjects);
     load(
         &mut app,
         vec![
-            paused_summary("aaaa1111-0", "paused", 7),
-            paused_summary("bbbb2222-0", "pausing", 2),
+            pausing_task("paus0001-x", "Finishing turn"),
+            summary("open0001-x", "Plain", "open", Some("coding"), Some(5), "p"),
         ],
         vec![],
     );
-    let screen = render(&app, 120, 24);
-    assert!(screen.contains("PAUSED (2)"), "{screen}");
-    assert!(screen.contains("paused for"), "{screen}");
-    assert!(screen.contains("coding · pausing"), "{screen}");
+    let frame = render(&app, 120, 30);
+    let row = locate(&frame, "paus0001").expect("the pausing row is drawn");
+    assert_eq!(
+        row.section,
+        Section::InProgress,
+        "a pausing task is shown under {} instead of IN PROGRESS:\n{frame}",
+        row.section.title()
+    );
+    assert_eq!(
+        row.time.as_deref(),
+        Some("30m"),
+        "in-stage age, not the 2m request age or the 11m update age:\n{frame}"
+    );
+    assert!(row.row.contains("coding · pausing"), "{}", row.row);
+    // The paused section holds no task row, only its (empty) header.
+    assert!(frame.contains("PAUSED (0)"), "{frame}");
+}
+
+#[test]
+fn pausing_with_a_synthetic_waiting_flag_stays_in_progress() {
+    // Synthetic: the daemon sets `waiting_on_human` only on open tasks, so
+    // this combination is not emitted in production.
+    let mut synthetic = pausing_task("sync0001-x", "Synthetic");
+    synthetic.waiting_on_human = true;
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![
+            synthetic,
+            waiting(summary(
+                "need0001-x",
+                "Gate",
+                "open",
+                Some("awaiting_human_review"),
+                Some(9),
+                "p",
+            )),
+            paused_task("held0001-x", "Held"),
+        ],
+        vec![],
+    );
+    let s = app.sections();
+    assert_eq!(
+        ids(&s[1]),
+        ["sync0001-x"].map(String::from),
+        "pausing + waiting flag is not IN PROGRESS"
+    );
+    assert_eq!(ids(&s[0]), ["need0001-x"].map(String::from));
+    assert_eq!(ids(&s[2]), ["held0001-x"].map(String::from));
+}
+
+#[test]
+fn paused_and_pausing_rows_have_distinct_sections_and_timers() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![
+            paused_task("held0001-x", "Held"),
+            pausing_task("paus0001-x", "Finishing"),
+            summary("open0001-x", "Plain", "open", Some("coding"), Some(5), "p"),
+            waiting(summary(
+                "need0001-x",
+                "Gate",
+                "open",
+                Some("awaiting_human_review"),
+                Some(9),
+                "p",
+            )),
+        ],
+        vec![],
+    );
+    let frame = render(&app, 120, 30);
+    for h in [
+        "NEEDS YOU (1)",
+        "IN PROGRESS (2)",
+        "PAUSED (1)",
+        "STUCK (0)",
+    ] {
+        assert!(frame.contains(h), "missing {h}:\n{frame}");
+    }
+    let pausing = locate(&frame, "paus0001").unwrap();
+    assert_eq!(pausing.section, Section::InProgress, "{frame}");
+    assert_eq!(pausing.time.as_deref(), Some("30m"), "{frame}");
+    assert!(pausing.row.contains("coding · pausing"), "{}", pausing.row);
+    let held = locate(&frame, "held0001").unwrap();
+    assert_eq!(held.section, Section::Paused, "{frame}");
+    assert_eq!(held.time.as_deref(), Some("7m"), "{frame}");
+    assert!(!held.row.contains("pausing"), "{}", held.row);
+    assert_eq!(
+        locate(&frame, "need0001").unwrap().section,
+        Section::NeedsYou
+    );
+    assert_eq!(
+        locate(&frame, "open0001").unwrap().section,
+        Section::InProgress
+    );
+}
+
+#[test]
+fn in_progress_keeps_stage_entry_then_id_order_with_pausing_rows() {
+    let mut app = new_app(Scope::AllProjects);
+    let open = |id: &str, mins: Option<i64>| summary(id, "Open", "open", Some("coding"), mins, "p");
+    let pausing = |id: &str, mins: Option<i64>| at_coding(id, "Slow", "pausing", mins, Some(2), 11);
+    // Reversed from the expected order.
+    load(
+        &mut app,
+        vec![
+            pausing("unkn-pau", None),
+            open("same-b-o", Some(30)),
+            pausing("same-a-p", Some(30)),
+            pausing("same-d-p", Some(20)),
+            open("same-c-o", Some(20)),
+            pausing("oldest-p", Some(50)),
+        ],
+        vec![],
+    );
+    assert_eq!(
+        ids(&app.sections()[1]),
+        [
+            "oldest-p", "same-a-p", "same-b-o", "same-c-o", "same-d-p", "unkn-pau"
+        ]
+        .map(String::from)
+    );
+}
+
+#[test]
+fn refreshed_pause_status_alone_moves_the_row_to_paused() {
+    let mut app = new_app(Scope::AllProjects);
+    let id = "paus0001-0000-4000-8000-000000000001";
+    let other = summary("open0001-x", "Plain", "open", Some("coding"), Some(5), "p");
+    for updated in [11, 4] {
+        load(
+            &mut app,
+            vec![
+                at_coding(id, "Finishing", "pausing", Some(30), Some(2), updated),
+                other.clone(),
+            ],
+            vec![],
+        );
+        let frame = render(&app, 120, 30);
+        let row = locate(&frame, "paus0001").unwrap();
+        assert_eq!(
+            row.section,
+            Section::InProgress,
+            "refresh {updated}:\n{frame}"
+        );
+        assert_eq!(row.time.as_deref(), Some("30m"), "{frame}");
+        assert!(row.row.contains("coding · pausing"), "{}", row.row);
+        assert_eq!(frame.matches("paus0001").count(), 1, "{frame}");
+    }
+    // The settled snapshot entered the next held stage 3m ago; the pause was
+    // still asked for 2m ago. The paused clock reads the request, not that.
+    let mut settled = at_coding(id, "Finishing", "paused", Some(3), Some(2), 1);
+    settled.current_stage = Some("review".to_string());
+    load(&mut app, vec![settled, other], vec![]);
+    let frame = render(&app, 120, 30);
+    let row = locate(&frame, "paus0001").unwrap();
+    assert_eq!(row.section, Section::Paused, "{frame}");
+    assert_eq!(row.time.as_deref(), Some("2m"), "{frame}");
+    assert!(!row.row.contains("pausing"), "{}", row.row);
+    assert_eq!(frame.matches("paus0001").count(), 1, "{frame}");
+    assert!(frame.contains("IN PROGRESS (1)"), "{frame}");
+}
+
+#[test]
+fn a_failed_pause_refresh_moves_the_row_to_stuck() {
+    let mut app = new_app(Scope::AllProjects);
+    let id = "paus0001-0000-4000-8000-000000000001";
+    load(&mut app, vec![pausing_task(id, "Finishing")], vec![]);
+    assert_eq!(app.sections()[1].len(), 1);
+    let failed = stuck(
+        at_coding(id, "Finishing", "stuck", Some(30), None, 4),
+        "boom: exit 1",
+        4,
+    );
+    load(&mut app, vec![failed], vec![]);
+    let frame = render(&app, 120, 30);
+    let row = locate(&frame, "paus0001").unwrap();
+    assert_eq!(
+        row.section,
+        Section::Stuck,
+        "a failed pause shows as {}:\n{frame}",
+        row.section.title()
+    );
+    assert!(row.row.contains("boom: exit 1"), "{}", row.row);
+    assert_eq!(row.time.as_deref(), Some("4m"), "{frame}");
+    assert_eq!(frame.matches("paus0001").count(), 1, "{frame}");
+}
+
+#[test]
+fn resuming_before_settlement_restores_open_grouping() {
+    let mut app = new_app(Scope::AllProjects);
+    let id = "paus0001-0000-4000-8000-000000000001";
+    load(&mut app, vec![pausing_task(id, "Finishing")], vec![]);
+    let resumed = at_coding(id, "Finishing", "open", Some(30), None, 1);
+    load(&mut app, vec![resumed], vec![]);
+    let frame = render(&app, 120, 30);
+    let row = locate(&frame, "paus0001").unwrap();
+    assert_eq!(row.section, Section::InProgress, "{frame}");
+    assert_eq!(row.time.as_deref(), Some("30m"), "{frame}");
+    assert!(!row.row.contains("pausing"), "{}", row.row);
+    assert_eq!(frame.matches("paus0001").count(), 1, "{frame}");
+    // At a human gate, the same id is an ordinary open-waiting task.
+    let mut gate = at_coding(id, "Finishing", "open", Some(30), None, 1);
+    gate.current_stage = Some("awaiting_human_review".to_string());
+    gate.waiting_on_human = true;
+    load(&mut app, vec![gate], vec![]);
+    let frame = render(&app, 120, 30);
+    assert_eq!(
+        locate(&frame, "paus0001").unwrap().section,
+        Section::NeedsYou,
+        "{frame}"
+    );
+    assert_eq!(frame.matches("paus0001").count(), 1, "{frame}");
+}
+
+#[test]
+fn a_pausing_row_without_stage_time_shows_unknown_age() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![at_coding(
+            "paus0001-x",
+            "No entry",
+            "pausing",
+            None,
+            Some(2),
+            11,
+        )],
+        vec![],
+    );
+    let frame = render(&app, 120, 30);
+    let row = locate(&frame, "paus0001").unwrap();
+    assert_eq!(row.section, Section::InProgress, "{frame}");
+    assert_eq!(row.time.as_deref(), Some("?"), "{frame}");
+    assert!(row.row.contains("coding · pausing"), "{}", row.row);
+}
+
+#[test]
+fn pause_grouping_fixtures_render_at_every_supported_size() {
+    let snap = |name: &str| -> Vec<TaskSummary> {
+        let other = summary("open0001-x", "Plain", "open", Some("coding"), Some(5), "p");
+        let mut synthetic = pausing_task("sync0001-x", "Synthetic");
+        synthetic.waiting_on_human = true;
+        match name {
+            "mixed" => vec![
+                pausing_task("paus0001-x", "Finishing"),
+                paused_task("held0001-x", "Held"),
+                other,
+                waiting(summary(
+                    "need0001-x",
+                    "Gate",
+                    "open",
+                    Some("awaiting_human_review"),
+                    Some(9),
+                    "p",
+                )),
+            ],
+            "synthetic" => vec![synthetic, paused_task("held0001-x", "Held")],
+            "settled" => vec![paused_task("paus0001-x", "Finishing")],
+            "failed" => vec![stuck(
+                at_coding("paus0001-x", "Finishing", "stuck", Some(30), None, 4),
+                "boom",
+                4,
+            )],
+            "resumed" => vec![at_coding(
+                "paus0001-x",
+                "Finishing",
+                "open",
+                Some(30),
+                None,
+                1,
+            )],
+            "unknown" => vec![at_coding(
+                "paus0001-x",
+                "Finishing",
+                "pausing",
+                None,
+                Some(2),
+                11,
+            )],
+            _ => unreachable!(),
+        }
+    };
+    // (fixture, id, expected section, expected time token, pausing marker)
+    let cases: [(&str, &str, Section, &str, bool); 9] = [
+        ("mixed", "paus0001", Section::InProgress, "30m", true),
+        ("mixed", "held0001", Section::Paused, "7m", false),
+        ("mixed", "need0001", Section::NeedsYou, "9m", false),
+        ("synthetic", "sync0001", Section::InProgress, "30m", true),
+        ("synthetic", "held0001", Section::Paused, "7m", false),
+        ("settled", "paus0001", Section::Paused, "7m", false),
+        ("failed", "paus0001", Section::Stuck, "4m", false),
+        ("resumed", "paus0001", Section::InProgress, "30m", false),
+        ("unknown", "paus0001", Section::InProgress, "?", true),
+    ];
+    for (fixture, id, want_section, want_time, marker) in cases {
+        let mut app = new_app(Scope::AllProjects);
+        load(&mut app, snap(fixture), vec![]);
+        let ids_all = app.flat_ids();
+        let target = ids_all.iter().find(|i| i.starts_with(id)).unwrap().clone();
+        let home = app
+            .sections()
+            .iter()
+            .position(|s| s.iter().any(|t| t.task.id == target))
+            .unwrap();
+        assert_eq!(Section::ALL[home], want_section, "{fixture}/{id}");
+        app.selected = Some(target);
+        for w in 40..=140u16 {
+            for h in 10..=40u16 {
+                let frame = render(&app, w, h);
+                for line in frame.lines() {
+                    assert!(line.chars().count() <= usize::from(w), "{fixture} {w}x{h}");
+                }
+                let ctx = format!("{fixture}/{id} at {w}x{h}:\n{frame}");
+                let Some(row) = locate_any(&frame, id) else {
+                    panic!("selected row not visible: {ctx}");
+                };
+                let tokens: Vec<&str> = row.split_whitespace().collect();
+                assert!(tokens.contains(&want_time), "{ctx}");
+                // The request and update ages must not stand in for it.
+                for wrong in ["2m", "11m", "13m"] {
+                    if wrong != want_time {
+                        assert!(!tokens.contains(&wrong), "{wrong} shown: {ctx}");
+                    }
+                }
+                if w < 60 {
+                    assert!(!row.contains("coding"), "{ctx}");
+                }
+                if marker && w >= 100 {
+                    assert!(row.contains("coding · pausing"), "{ctx}");
+                }
+                if !marker {
+                    assert!(!row.contains("pausing"), "{ctx}");
+                }
+                if w == 120 && h == 30 {
+                    assert_eq!(locate(&frame, id).unwrap().section, want_section, "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+/// The row line for `id8` anywhere on the frame, headers or not.
+fn locate_any(frame: &str, id8: &str) -> Option<String> {
+    frame
+        .lines()
+        .find(|l| l.chars().skip(2).take(8).collect::<String>() == id8)
+        .map(str::to_string)
 }
 
 #[test]
