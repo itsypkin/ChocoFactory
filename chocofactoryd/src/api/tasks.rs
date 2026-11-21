@@ -197,7 +197,7 @@ pub struct TaskDetail {
 /// The review the payload's `review_stage` pointer names: the capture of that
 /// stage, read the way `GET /tasks` reads it. A missing or mistyped pointer,
 /// `stages` or capture means no review, never a lookup anywhere else.
-fn reviews_of(payload: &Value) -> Vec<ReviewRef> {
+pub(crate) fn reviews_of(payload: &Value) -> Vec<ReviewRef> {
     let Some(stage) = payload.get(REVIEW_STAGE_KEY).and_then(Value::as_str) else {
         return Vec::new();
     };
@@ -638,6 +638,7 @@ fn tests_support_bad_cli_yaml() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use chocofactory_core::models::REVIEW_STAGE_KEY;
     use serde_json::{Value, json};
 
     use super::super::tests::TestServer;
@@ -1791,41 +1792,47 @@ stages:
             .collect()
     }
 
+    /// Sets a task's workflow payload (and loop counters) directly.
+    async fn set_payload(server: &TestServer, id: &str, payload: Value) {
+        sqlx::query("UPDATE workflow_state SET payload = ?, loop_counters = ? WHERE task_id = ?")
+            .bind(payload.to_string())
+            .bind(json!({"gate": {"count": 2}}).to_string())
+            .bind(id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+    }
+
+    fn review_json(stage: &str, number: u64, url: &str, label: &str) -> Value {
+        json!({"stage": stage, "number": number, "url": url, "label": label})
+    }
+
     #[tokio::test]
-    async fn list_rows_carry_workflow_facts_and_the_pull_request() {
+    async fn list_rows_carry_workflow_facts_and_the_pointed_review() {
         let server = TestServer::start().await;
         seed_gate_only(&server);
         let project_id = create_project(&server).await;
-        let with_pr = make_task(&server, &project_id, "with pr").await;
+        let published = make_task(&server, &project_id, "published").await;
         let without = make_task(&server, &project_id, "without").await;
-        let odd = make_task(&server, &project_id, "odd url").await;
-
-        let set_payload = |id: String, payload: Value| {
-            let pool = server.pool().clone();
-            async move {
-                sqlx::query(
-                    "UPDATE workflow_state SET payload = ?, loop_counters = ? WHERE task_id = ?",
-                )
-                .bind(payload.to_string())
-                .bind(json!({"gate": {"count": 2}}).to_string())
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
-            }
-        };
+        let old_shaped = make_task(&server, &project_id, "old shaped").await;
+        let self_hosted = "https://git.example.internal/group/sub/proj/-/merge_requests/42";
+        // `a_notes` sorts first and has a /pull/ URL of its own: only the
+        // pointed stage is the review.
         set_payload(
-            with_pr.clone(),
-            json!({"stages": {
+            &server,
+            &published,
+            json!({REVIEW_STAGE_KEY: "publish", "stages": {
+                "a_notes": {"number": 9, "url": "https://github.com/o/r/pull/9"},
                 "plain": "text",
-                "review": {"text": "huge", "url": "https://example.com/build/1"},
-                "open_pr": {"url": "https://github.com/o/r/pull/171"},
+                "publish": {"number": 42, "url": self_hosted, "label": "!42", "extra": 1},
             }}),
         )
         .await;
+        // The shape the old query read: a /pull/ URL and no pointer.
         set_payload(
-            odd.clone(),
-            json!({"stages": {"open_pr": {"url": "https://github.com/o/r/pull/abc"}}}),
+            &server,
+            &old_shaped,
+            json!({"stages": {"open_pr": {"url": "https://github.com/o/r/pull/171"}}}),
         )
         .await;
 
@@ -1834,17 +1841,171 @@ stages:
         assert_eq!(rows.len(), 3);
         let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
 
-        let r = row(&with_pr);
+        let r = row(&published);
         assert_eq!(r["current_stage"], "gate");
         assert!(r["stage_entered_at"].is_string());
         assert_eq!(r["loop_counters"], json!({"gate": {"count": 2}}));
-        assert_eq!(
-            r["pr"],
-            json!({"number": 171, "url": "https://github.com/o/r/pull/171"})
-        );
-        assert_eq!(r["title"], "with pr");
-        assert!(row(&without)["pr"].is_null());
-        assert!(row(&odd)["pr"].is_null());
+        let expected = json!([review_json("publish", 42, self_hosted, "!42")]);
+        assert_eq!(r["reviews"], expected);
+        assert_eq!(r["title"], "published");
+        assert_eq!(row(&without)["reviews"], json!([]));
+        assert_eq!(row(&old_shaped)["reviews"], json!([]));
+        // The task API has `reviews` and no `pr` alias, in the list and the detail.
+        assert!(r.get("pr").is_none());
+        let detail: Value = server.get(&format!("/tasks/{published}")).await.json();
+        assert_eq!(detail["reviews"], expected);
+        assert!(detail.get("pr").is_none());
+        let detail: Value = server.get(&format!("/tasks/{old_shaped}")).await.json();
+        assert_eq!(detail["reviews"], json!([]));
+    }
+
+    /// Whatever shape a payload has, the list and the detail answer with no
+    /// review rather than failing, and healthy rows beside them still show theirs.
+    #[tokio::test]
+    async fn an_unreadable_review_shape_is_no_review_and_never_breaks_the_list() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let project_id = create_project(&server).await;
+        let url = "https://github.com/o/r/pull/3";
+        let capture = |c: Value| json!({REVIEW_STAGE_KEY: "publish", "stages": {"publish": c}});
+        let bad: Vec<(&str, Value)> = vec![
+            (
+                "missing capture",
+                json!({REVIEW_STAGE_KEY: "publish", "stages": {}}),
+            ),
+            ("numeric capture", capture(json!(5))),
+            (
+                "string of JSON",
+                capture(json!(r#"{"number":3,"url":"https://h/x"}"#)),
+            ),
+            ("array capture", capture(json!([{"number": 3, "url": url}]))),
+            ("null capture", capture(json!(null))),
+            (
+                "pointer null",
+                json!({REVIEW_STAGE_KEY: null, "stages": {"publish": {"number": 3, "url": url}}}),
+            ),
+            (
+                "pointer bool",
+                json!({REVIEW_STAGE_KEY: true, "stages": {"publish": {"number": 3, "url": url}}}),
+            ),
+            (
+                "pointer number",
+                json!({REVIEW_STAGE_KEY: 5, "stages": {"publish": {"number": 3, "url": url}}}),
+            ),
+            (
+                "pointer array",
+                json!({REVIEW_STAGE_KEY: ["publish"], "stages": {"publish": {"number": 3, "url": url}}}),
+            ),
+            (
+                "pointer object",
+                json!({REVIEW_STAGE_KEY: {"publish": 1}, "stages": {"publish": {"number": 3, "url": url}}}),
+            ),
+            ("no stages", json!({REVIEW_STAGE_KEY: "publish"})),
+            (
+                "stages null",
+                json!({REVIEW_STAGE_KEY: "publish", "stages": null}),
+            ),
+            (
+                "stages array",
+                json!({REVIEW_STAGE_KEY: "publish", "stages": [{"number": 3, "url": url}]}),
+            ),
+            (
+                "stages text",
+                json!({REVIEW_STAGE_KEY: "publish", "stages": "publish"}),
+            ),
+            ("no number", capture(json!({"url": url}))),
+            ("null number", capture(json!({"number": null, "url": url}))),
+            ("zero", capture(json!({"number": 0, "url": url}))),
+            ("negative", capture(json!({"number": -1, "url": url}))),
+            ("float", capture(json!({"number": 1.5, "url": url}))),
+            ("string number", capture(json!({"number": "3", "url": url}))),
+            ("no url", capture(json!({"number": 3}))),
+            ("null url", capture(json!({"number": 3, "url": null}))),
+            ("number url", capture(json!({"number": 3, "url": 5}))),
+        ];
+        let mut ids = Vec::new();
+        for (name, payload) in &bad {
+            let id = make_task(&server, &project_id, name).await;
+            set_payload(&server, &id, payload.clone()).await;
+            ids.push(id);
+        }
+        // No workflow_state at all.
+        let stateless = make_task(&server, &project_id, "stateless").await;
+        sqlx::query("DELETE FROM workflow_state WHERE task_id = ?")
+            .bind(&stateless)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        ids.push(stateless);
+        // Healthy rows, with the label falling back or used literally.
+        let mut healthy = Vec::new();
+        for (label, want) in [
+            (json!(null), "#3"),
+            (json!(""), "#3"),
+            (json!(5), "#3"),
+            (json!("MR-3"), "MR-3"),
+        ] {
+            let id = make_task(&server, &project_id, &format!("healthy {want} {label}")).await;
+            set_payload(
+                &server,
+                &id,
+                capture(json!({"number": 3, "url": url, "label": label})),
+            )
+            .await;
+            healthy.push((id, want));
+        }
+
+        let listed: Value = server.get("/tasks").await.json();
+        let rows = listed.as_array().unwrap();
+        assert_eq!(rows.len(), ids.len() + healthy.len());
+        for id in &ids {
+            let row = rows.iter().find(|r| r["id"] == *id).unwrap();
+            assert_eq!(row["reviews"], json!([]), "{}", row["title"]);
+            let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+            assert_eq!(detail["reviews"], json!([]), "{}", row["title"]);
+        }
+        for (id, want) in &healthy {
+            let expected = json!([review_json("publish", 3, url, want)]);
+            let row = rows.iter().find(|r| r["id"] == *id).unwrap();
+            assert_eq!(row["reviews"], expected);
+            let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+            assert_eq!(detail["reviews"], expected);
+        }
+    }
+
+    /// Selecting the review never loads the workflow definition.
+    #[tokio::test]
+    async fn a_pointed_review_stays_readable_after_its_workflow_file_is_deleted() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let file_dir = server.temp_dir();
+        let workflow_path = file_dir.join("mine.yaml");
+        std::fs::copy(server.builtin_workflow_path("gate-only"), &workflow_path).unwrap();
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({"project_id": project_id, "workflow_file": workflow_path.to_str().unwrap(),
+                       "title": "t", "prompt": "hello"}),
+            )
+            .await
+            .json();
+        let id = task["id"].as_str().unwrap().to_string();
+        let url = "https://git.example.internal/g/p/-/merge_requests/8";
+        set_payload(
+            &server,
+            &id,
+            json!({REVIEW_STAGE_KEY: "publish", "stages": {"publish": {"number": 8, "url": url, "label": "!8"}}}),
+        )
+        .await;
+        std::fs::remove_file(&workflow_path).unwrap();
+
+        let expected = json!([review_json("publish", 8, url, "!8")]);
+        let listed: Value = server.get("/tasks").await.json();
+        assert_eq!(listed[0]["reviews"], expected);
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "missing");
+        assert_eq!(detail["reviews"], expected);
     }
 
     #[tokio::test]

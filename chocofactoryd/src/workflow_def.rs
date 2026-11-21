@@ -2461,6 +2461,9 @@ impl fmt::Display for WorkflowDefError {
 impl std::error::Error for WorkflowDefError {}
 
 #[cfg(test)]
+mod open_review_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2478,6 +2481,10 @@ stages:
   b:
     kind: shell
     command: "true"
+    on: { done: b2 }
+  b2:
+    kind: open_review
+    command: "true"
     on: { done: c }
   c:
     kind: poll
@@ -2494,13 +2501,20 @@ stages:
     kind: terminal
 "#;
         let def = WorkflowDefinition::parse(yaml, Path::new(".")).unwrap();
-        let names: Vec<_> = ["a", "b", "c", "d", "e"]
+        let names: Vec<_> = ["a", "b", "b2", "c", "d", "e"]
             .iter()
             .map(|s| def.stages[*s].kind.name())
             .collect();
         assert_eq!(
             names,
-            ["agent_turn", "shell", "poll", "human_gate", "terminal"]
+            [
+                "agent_turn",
+                "shell",
+                "open_review",
+                "poll",
+                "human_gate",
+                "terminal"
+            ]
         );
     }
     use std::io::Write;
@@ -5133,6 +5147,11 @@ stages:
                 "shell",
                 "intervall",
                 "    kind: shell\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "open_review",
+                "intervall",
+                "    kind: open_review\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
             ),
             (
                 "terminal",

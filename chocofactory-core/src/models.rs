@@ -1055,6 +1055,83 @@ pub fn review_ref(stage: &str, capture: &Value) -> Option<ReviewRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn review(number: u64, url: &str, label: &str) -> Option<ReviewRef> {
+        Some(ReviewRef {
+            stage: "publish".into(),
+            number,
+            url: url.into(),
+            label: label.into(),
+        })
+    }
+
+    #[test]
+    fn review_ref_reads_a_capture_object_and_nothing_else() {
+        let url = "https://git.example.internal/g/p/-/merge_requests/42";
+        // A nonempty string label is used literally, spaces and all.
+        assert_eq!(
+            review_ref(
+                "publish",
+                &json!({"number": 42, "url": url, "label": " !42 "})
+            ),
+            review(42, url, " !42 ")
+        );
+        // Anything else falls back to #<number>.
+        for label in [json!(null), json!(""), json!(7), json!(["!42"]), json!({})] {
+            assert_eq!(
+                review_ref(
+                    "publish",
+                    &json!({"number": 42, "url": url, "label": label})
+                ),
+                review(42, url, "#42"),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            review_ref("publish", &json!({"number": 42, "url": url})),
+            review(42, url, "#42")
+        );
+        // The URL is not reinterpreted: no /pull/, no scheme, still a review.
+        assert_eq!(
+            review_ref("publish", &json!({"number": u64::MAX, "url": "whatever"})),
+            review(u64::MAX, "whatever", &format!("#{}", u64::MAX))
+        );
+        // Not an object.
+        for capture in [
+            json!("text"),
+            json!(5),
+            json!(null),
+            json!([{"number": 1, "url": "u"}]),
+        ] {
+            assert_eq!(review_ref("publish", &capture), None, "{capture}");
+        }
+        // The number must be a positive integer.
+        for number in [
+            json!(0),
+            json!(-1),
+            json!(7.5),
+            json!(7.0),
+            json!("7"),
+            json!(null),
+            json!(true),
+        ] {
+            assert_eq!(
+                review_ref("publish", &json!({"number": number, "url": url})),
+                None,
+                "{number}"
+            );
+        }
+        // The url must be a string.
+        for url in [json!(null), json!(5), json!(["u"])] {
+            assert_eq!(
+                review_ref("publish", &json!({"number": 1, "url": url})),
+                None
+            );
+        }
+        assert_eq!(review_ref("publish", &json!({"url": "u"})), None);
+        assert_eq!(review_ref("publish", &json!({"number": 1})), None);
+    }
 
     #[test]
     fn retry_outcome_without_branches_deserializes_to_an_empty_list() {

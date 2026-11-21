@@ -30,11 +30,11 @@ stages:
     kind: terminal
 "#;
 
-struct GateFlow {
-    pool: SqlitePool,
-    engine: Arc<WorkflowEngine>,
-    def: Arc<WorkflowDefinition>,
-    task_id: String,
+pub(super) struct GateFlow {
+    pub(super) pool: SqlitePool,
+    pub(super) engine: Arc<WorkflowEngine>,
+    pub(super) def: Arc<WorkflowDefinition>,
+    pub(super) task_id: String,
     _dir: TempDir,
 }
 
@@ -42,7 +42,7 @@ async fn gate_flow() -> GateFlow {
     gate_flow_from(GATE_FLOW, connect_in_memory().await.unwrap(), tempdir()).await
 }
 
-async fn gate_flow_from(yaml: &str, pool: SqlitePool, dir: TempDir) -> GateFlow {
+pub(super) async fn gate_flow_from(yaml: &str, pool: SqlitePool, dir: TempDir) -> GateFlow {
     fs::write(dir.join("sr-gate.yaml"), yaml).unwrap();
     let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
     let task_id = seed_task(&pool, &def.name).await;
@@ -58,40 +58,44 @@ async fn gate_flow_from(yaml: &str, pool: SqlitePool, dir: TempDir) -> GateFlow 
 }
 
 impl GateFlow {
-    async fn reply(&self, text: &str) -> Result<(), SendMessageOrResumeError> {
+    pub(super) async fn reply(&self, text: &str) -> Result<(), SendMessageOrResumeError> {
         self.engine
             .send_message_or_resume(&self.task_id, text)
             .await
     }
 
-    async fn results(&self) -> Vec<Event> {
+    pub(super) async fn results(&self) -> Vec<Event> {
         stage_results(&self.pool, &self.task_id).await
     }
 
-    async fn state(&self) -> chocofactory_core::models::WorkflowState {
+    pub(super) async fn state(&self) -> chocofactory_core::models::WorkflowState {
         state_of(&self.pool, &self.task_id).await
     }
 }
 
-fn result_of(event: &Event) -> AppliedStageResult {
+pub(super) fn result_of(event: &Event) -> AppliedStageResult {
     AppliedStageResult::from_event(event).unwrap()
 }
 
-async fn ask(pool: &SqlitePool, task_id: &str, request: ContextRequest) -> ContextResponse {
+pub(super) async fn ask(
+    pool: &SqlitePool,
+    task_id: &str,
+    request: ContextRequest,
+) -> ContextResponse {
     match context::lookup(pool, task_id, &request).await.unwrap() {
         Lookup::Found(answer) | Lookup::UnknownId(answer) => answer,
         Lookup::NoSuchTask => panic!("no such task {task_id}"),
     }
 }
 
-fn found(answer: ContextResponse) -> AppliedStageResult {
+pub(super) fn found(answer: ContextResponse) -> AppliedStageResult {
     match answer {
         ContextResponse::StageResult { result, .. } => result,
         other => panic!("expected an applied result, got {other:?}"),
     }
 }
 
-fn by_name(stage: &str, outcome: Option<&str>, anchor: Option<&str>) -> ContextRequest {
+pub(super) fn by_name(stage: &str, outcome: Option<&str>, anchor: Option<&str>) -> ContextRequest {
     ContextRequest::StageByName {
         stage: stage.to_string(),
         outcome: outcome.map(str::to_string),

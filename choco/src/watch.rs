@@ -871,7 +871,7 @@ mod tests {
         let a = Until::Attention;
         let g = kind("open", Some("human_gate"));
         assert!(reached(&a, &g, &g));
-        for k in ["agent_turn", "shell", "poll", "terminal"] {
+        for k in ["agent_turn", "shell", "open_review", "poll", "terminal"] {
             let n = kind("open", Some(k));
             assert!(!reached(&a, &g, &n), "{k}");
         }

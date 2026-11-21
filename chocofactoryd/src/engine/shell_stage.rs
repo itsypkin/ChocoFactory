@@ -386,3 +386,192 @@ impl WorkflowEngine {
         .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GITHUB: &str = "https://github.com/o/r/pull/7";
+    const MERGE_REQUEST: &str = "https://git.example.internal/group/sub/proj/-/merge_requests/42";
+
+    fn ok(stdout: &str) -> Value {
+        validate_review_output(stdout).unwrap_or_else(|reason| panic!("{stdout:?}: {reason}"))
+    }
+
+    #[track_caller]
+    fn rejected(stdout: &str, reason: &str) {
+        match validate_review_output(stdout) {
+            Err(got) => assert!(
+                got.contains(reason),
+                "{stdout:?}: wanted {reason:?} in {got:?}"
+            ),
+            Ok(value) => panic!("{stdout:?} was accepted as {value}"),
+        }
+    }
+
+    /// A valid JSON object of exactly `len` bytes, padded in an extra field.
+    fn document_of(len: usize) -> String {
+        let build = |pad: usize| {
+            format!(
+                r#"{{"number":1,"url":"https://h/x/1","pad":"{}"}}"#,
+                "p".repeat(pad)
+            )
+        };
+        let document = build(len - build(0).len());
+        assert_eq!(document.len(), len);
+        document
+    }
+
+    #[test]
+    fn accepted_output_is_kept_as_printed_with_a_label_filled_in() {
+        // GitHub-shaped, label omitted: #<number>.
+        assert_eq!(
+            ok(&format!(r#"{{"number":7,"url":"{GITHUB}"}}"#)),
+            json!({"number": 7, "url": GITHUB, "label": "#7"})
+        );
+        // A self-hosted merge request with its own label and extra fields.
+        let printed = json!({"number": 42, "url": MERGE_REQUEST, "label": "!42",
+                             "extra": "x", "nested": {"a": [1, null, 2.50]}});
+        assert_eq!(ok(&format!("\n  {printed}  \n")), printed);
+        // A supplied label is not trimmed or rewritten.
+        assert_eq!(
+            ok(&format!(
+                r#"{{"number":1,"url":"{GITHUB}","label":"  !1  "}}"#
+            ))["label"],
+            "  !1  "
+        );
+        // Schemes match without regard to ASCII case.
+        for url in ["HTTP://h/x", "HtTpS://h/x", "https://h", "http://h"] {
+            ok(&format!(r#"{{"number":1,"url":"{url}"}}"#));
+        }
+        // The largest number a u64 holds.
+        assert_eq!(
+            ok(&format!(r#"{{"number":{},"url":"{GITHUB}"}}"#, u64::MAX))["number"],
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn the_size_limit_counts_trimmed_bytes_and_comes_first() {
+        let at_limit = document_of(MAX_CAPTURE_BYTES);
+        ok(&at_limit);
+        // Surrounding whitespace is not counted.
+        ok(&format!("\n\n  {at_limit}\t \n"));
+        let over = document_of(MAX_CAPTURE_BYTES + 1);
+        rejected(&over, "output exceeds the 1048576-byte capture limit");
+        // Oversized and not JSON at all: the size is what is reported.
+        rejected(
+            &"x".repeat(MAX_CAPTURE_BYTES + 1),
+            "output exceeds the 1048576-byte capture limit",
+        );
+        assert_eq!(
+            validate_review_output(&over).unwrap_err(),
+            "output exceeds the 1048576-byte capture limit"
+        );
+    }
+
+    #[test]
+    fn output_that_is_not_one_json_object_is_rejected() {
+        let valid = format!(r#"{{"number":1,"url":"{GITHUB}"}}"#);
+        rejected("", "output must be valid JSON");
+        rejected("opened it", "output must be valid JSON");
+        rejected(
+            &format!("```json\n{valid}\n```"),
+            "output must be valid JSON",
+        );
+        rejected(&format!("Opened: {valid}"), "output must be valid JSON");
+        rejected(&format!("{valid}\n{valid}"), "output must be valid JSON");
+        rejected(&format!("{valid} trailing"), "output must be valid JSON");
+        for other in ["[1]", "null", "7", "\"text\"", "true"] {
+            rejected(other, "output must be a JSON object");
+        }
+        rejected(&format!("[{valid}]"), "output must be a JSON object");
+    }
+
+    #[test]
+    fn the_number_must_be_a_positive_integer() {
+        // Zero first: dropping the positivity check fails here.
+        for number in [
+            "0",
+            "-1",
+            "7.0",
+            r#""7""#,
+            "null",
+            "true",
+            "18446744073709551616",
+            "1e2",
+        ] {
+            rejected(
+                &format!(r#"{{"number":{number},"url":"{GITHUB}"}}"#),
+                "`number` must be a positive integer",
+            );
+        }
+        rejected(
+            &format!(r#"{{"url":"{GITHUB}"}}"#),
+            "`number` must be a positive integer",
+        );
+    }
+
+    #[test]
+    fn the_url_must_be_an_http_url_without_whitespace() {
+        rejected(r#"{"number":1}"#, "`url` must be a string");
+        for url in ["null", "5", r#"["u"]"#] {
+            rejected(
+                &format!(r#"{{"number":1,"url":{url}}}"#),
+                "`url` must be a string",
+            );
+        }
+        let prefix = "`url` must start with http:// or https:// and have a nonempty remainder";
+        for url in [
+            "ftp://h/x",
+            "h/x",
+            "",
+            "http://",
+            "https://",
+            "HTTPS://",
+            "httpx://h",
+        ] {
+            rejected(&format!(r#"{{"number":1,"url":"{url}"}}"#), prefix);
+        }
+        // Every kind of whitespace, anywhere: ASCII, Unicode, in the middle or the end.
+        for url in [
+            "https://h/a b",
+            "https://h/x ",
+            "https://h/\\tx",
+            "https://h/\\nx",
+            "https://h/a\u{a0}b",
+            "https://h/a\u{2003}b",
+            "https://h/a\u{3000}",
+        ] {
+            rejected(
+                &format!(r#"{{"number":1,"url":"{url}"}}"#),
+                "`url` must contain no whitespace",
+            );
+        }
+    }
+
+    #[test]
+    fn the_label_must_be_a_nonempty_single_line_string() {
+        let reason = "`label` must be a nonempty single-line string";
+        // The LF row comes before every other bad label: dropping the label
+        // check fails here first.
+        for label in [
+            r#""a\nb""#,
+            r#""""#,
+            r#""   ""#,
+            r#""a\rb""#,
+            r#""a\r\nb""#,
+            r#""\r""#,
+            "null",
+            "7",
+            r#"["!1"]"#,
+            "{}",
+            "true",
+        ] {
+            rejected(
+                &format!(r#"{{"number":1,"url":"{GITHUB}","label":{label}}}"#),
+                reason,
+            );
+        }
+    }
+}
