@@ -743,12 +743,9 @@ When the command exits `0`, its whole standard output must be one JSON object:
   records `#<number>`, so after a successful publication `label` is always
   there. A label you give is kept exactly as printed.
 - Every other field is kept as printed, and objects stay objects, whatever
-  their keys. A number is kept with its value, though it may be respelled
-  (`1.10` as `1.1`, `1e5` as `100000.0`). One that choco can't store exactly,
-  because it is outside the 64-bit integers and has digits a double can't
-  hold (`18446744073709551617`, `0.1000000000000000055511151231257827`,
-  `1.9651349465042103`), or an exponent outside a double's range, is not
-  rounded: it fails the stage. Print such a value as a string.
+  their keys. Extra fields are stored as JSON values the way choco parses them,
+  so very large or very precise numbers may be rounded; a script that needs
+  exact digits prints them as a string.
 - The output must be valid UTF-8. A command that prints other bytes (even
   inside a string) fails the stage, because the bytes can't be told apart from
   text without changing them. A real U+FFFD character, written as its UTF-8
