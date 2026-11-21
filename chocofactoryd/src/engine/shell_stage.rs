@@ -154,19 +154,28 @@ fn first_inexact_number(json: &str) -> Option<&str> {
     None
 }
 
+/// Whether `token` survives being stored: parsed by the very parser every
+/// capture, history row and template read uses, and written back the way the
+/// database keeps it, the value must still be the one that was printed (a
+/// respelling such as `1.10` as `1.1` is the same value). That is decided on
+/// what `serde_json` actually keeps, not on another parser's answer: its
+/// default float parser can differ from `str::parse::<f64>` in the last digit.
 fn number_survives_parsing(token: &str) -> bool {
-    if token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok() {
-        return true;
-    }
-    let Ok(float) = token.parse::<f64>() else {
-        return false;
+    let first = match serde_json::from_str::<Value>(token) {
+        Ok(Value::Number(number)) => number.to_string(),
+        _ => return false,
     };
-    float.is_finite() && decimal_parts(token) == decimal_parts(&format!("{float:e}"))
+    match (decimal_parts(token), decimal_parts(&first)) {
+        (Some(printed), Some(kept)) => printed == kept,
+        _ => false,
+    }
 }
 
 /// `(negative, digits, exponent)` with the value `0.<digits> × 10^exponent`
 /// ignoring leading and trailing zeros, so spellings of one value compare
-/// equal; zero is `(false, "", 0)`. `None` for a token this can't read.
+/// equal; zero is `(false, "", 0)`. `None` for a token this can't read, and
+/// for an exponent that doesn't fit an `i64` (every step is checked: a token
+/// like `0.0001e-9223372036854775808` is valid JSON).
 fn decimal_parts(token: &str) -> Option<(bool, String, i64)> {
     let (negative, rest) = match token.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -178,9 +187,10 @@ fn decimal_parts(token: &str) -> Option<(bool, String, i64)> {
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let digits = format!("{whole}{fraction}");
-    let exponent = exponent.checked_add(whole.len() as i64)?;
+    let exponent = exponent.checked_add(i64::try_from(whole.len()).ok()?)?;
     let significant = digits.trim_start_matches('0');
-    let exponent = exponent - (digits.len() - significant.len()) as i64;
+    let leading_zeros = i64::try_from(digits.len() - significant.len()).ok()?;
+    let exponent = exponent.checked_sub(leading_zeros)?;
     let significant = significant.trim_end_matches('0');
     if significant.is_empty() {
         return Some((false, String::new(), 0));
@@ -556,6 +566,10 @@ mod tests {
                 r#""list":[1,2,123456789012345678901234567890]"#,
                 "123456789012345678901234567890",
             ),
+            // Short decimals the default float parser lands one digit away
+            // from: `str::parse::<f64>` keeps them, the stored value doesn't.
+            (r#""d":1.9651349465042103"#, "1.9651349465042103"),
+            (r#""d":2.3318716180463287e-130"#, "2.3318716180463287e-130"),
         ] {
             rejected(
                 &format!(r#"{{"number":7,"url":"https://h/7",{printed}}}"#),
@@ -567,6 +581,28 @@ mod tests {
             r#"{"number":18446744073709551617,"url":"https://h/7"}"#,
             "`number` must be a positive integer",
         );
+    }
+
+    #[test]
+    fn extreme_exponents_are_refused_or_kept_never_a_panic() {
+        // Valid JSON whose exponent arithmetic would overflow an i64.
+        for token in [
+            "0.0001e-9223372036854775808",
+            "0.0001e-9223372036854775807",
+            "1e-9223372036854775808",
+            "1e9223372036854775807",
+            "1e9223372036854775808",
+            "0.1e9223372036854775807",
+            "1e-99999999999999999999",
+        ] {
+            assert!(!number_survives_parsing(token), "{token}");
+            let printed = format!(r#"{{"number":7,"url":"https://h/7","x":{token}}}"#);
+            assert!(validate_review_output(&printed).is_err(), "{printed}");
+        }
+        // The helper itself reports an unreadable exponent instead of
+        // wrapping: the exponent minus the leading zeros overflows.
+        assert_eq!(decimal_parts("0.0001e-9223372036854775808"), None);
+        assert_eq!(decimal_parts("1e99999999999999999999"), None);
     }
 
     #[test]
