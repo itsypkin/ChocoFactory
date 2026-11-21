@@ -5,13 +5,30 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-fn dir() -> PathBuf {
+/// A fresh directory that is removed when the guard is dropped. Keep it alive
+/// as long as the definition being parsed needs its files.
+struct Dir(PathBuf);
+
+impl std::ops::Deref for Dir {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn dir() -> Dir {
     let path = std::env::temp_dir().join(format!(
         "chocofactoryd-open-review-{}",
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&path).unwrap();
-    path
+    Dir(path)
 }
 
 /// A workflow whose stage `publish` has `body` (indented under it), then a terminal.
@@ -248,4 +265,14 @@ fn a_publisher_shares_the_shell_reference_duration_env_and_template_checks() {
 fn a_later_stage_may_template_the_publishers_fields() {
     let yaml = "name: x\nstages:\n  publish:\n    kind: open_review\n    command: \"true\"\n    on: { done: after }\n  after:\n    kind: shell\n    command: \"echo {{ stages.publish.number }}\"\n    env: { L: \"{{ stages.publish.label }}\" }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
     parse(yaml, &dir()).unwrap();
+}
+
+#[test]
+fn a_test_directory_is_removed_when_its_guard_is_dropped() {
+    let guard = dir();
+    let path = guard.to_path_buf();
+    fs::write(path.join("p.md"), "x").unwrap();
+    assert!(path.is_dir());
+    drop(guard);
+    assert!(!path.exists());
 }

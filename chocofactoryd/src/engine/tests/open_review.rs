@@ -594,13 +594,15 @@ stages:
 
     f.write("go", "");
     f.wait_first_result().await;
-    // The lap is an error with no capture, and #1 is still the review.
+    // #1 is still the review. First, so a failed lap's stdout merged into the
+    // payload fails here, on #99 replacing #1, before the lap's own metadata.
+    assert_eq!(f.reviews().await, [github(1)]);
+    // And the lap is an error with no capture.
     let lap = result_of(&f.results().await[0]);
     assert_eq!(
         (lap.outcome.as_str(), lap.capture_present),
         ("error", false)
     );
-    assert_eq!(f.reviews().await, [github(1)]);
     let after = f.payload().await;
     assert_eq!(after["stages"], state.payload["stages"]);
     assert_eq!(after[REVIEW_STAGE_KEY], "publish");
@@ -667,6 +669,148 @@ stages:
         payload["stages"]["publish"],
         json!({"number": 7, "url": "https://github.com/o/r/pull/7", "extra": "x", "label": "#7"})
     );
+}
+
+#[tokio::test]
+async fn numbers_the_script_printed_are_kept_digit_for_digit_everywhere() {
+    // Each of these is changed by an f64 or a 64-bit round trip.
+    let f = Flow::new(
+        r#"name: review-numbers
+stages:
+  publish:
+    kind: open_review
+    command: |
+      printf '%s' '{"number":7,"url":"https://github.com/o/r/pull/7","big":18446744073709551617,"neg":-9223372036854775809,"deep":{"list":[123456789012345678901234567890,{"x":-170141183460469231731687303715884105729}]},"ratio":1.10,"tiny":0.1000000000000000055511151231257827}'
+    on: { done: render }
+  render:
+    kind: shell
+    command: 'printf "%s %s" "$R_BIG" "$R_NEG"'
+    env:
+      R_BIG: "{{ stages.publish.big }}"
+      R_NEG: "{{ stages.publish.neg }}"
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+    )
+    .await;
+    f.start().await;
+    f.wait_stage("finished").await;
+
+    let exact = |capture: &Value| {
+        assert_eq!(capture["big"].to_string(), "18446744073709551617");
+        assert_eq!(capture["neg"].to_string(), "-9223372036854775809");
+        assert_eq!(
+            capture["deep"]["list"][0].to_string(),
+            "123456789012345678901234567890"
+        );
+        assert_eq!(
+            capture["deep"]["list"][1]["x"].to_string(),
+            "-170141183460469231731687303715884105729"
+        );
+        assert_eq!(capture["ratio"].to_string(), "1.10");
+        assert_eq!(
+            capture["tiny"].to_string(),
+            "0.1000000000000000055511151231257827"
+        );
+        assert_eq!(capture["number"].to_string(), "7");
+    };
+    // The persisted payload the later stages and the API read...
+    exact(&f.payload().await["stages"]["publish"]);
+    // ...the history the stage result carries...
+    let results = f.results().await;
+    exact(&result_of(&results[0]).capture);
+    // ...and what a template hands to a later command.
+    assert_eq!(
+        f.payload().await["stages"]["render"],
+        "18446744073709551617 -9223372036854775809"
+    );
+}
+
+/// A publisher whose stdout is `format` through `printf`, so it can carry raw
+/// bytes, ending at `finished` on success and at `failed` on rejection.
+async fn raw_publisher(format: &str) -> Flow {
+    let f = Flow::publisher(
+        &format!("printf '{format}'"),
+        "{ done: finished, error: failed }",
+    )
+    .await;
+    f.start().await;
+    f.wait_first_result().await;
+    f
+}
+
+#[tokio::test]
+async fn output_bytes_that_are_not_utf8_are_rejected_in_every_string_field() {
+    // 0xff is never valid UTF-8; the shell runner would repair it to U+FFFD.
+    for (field, format) in [
+        ("url", r#"{"number":7,"url":"https://h/\377"}"#),
+        (
+            "label",
+            r##"{"number":7,"url":"https://h/7","label":"#\377"}"##,
+        ),
+        (
+            "extra",
+            r#"{"number":7,"url":"https://h/7","extra":"a\377b"}"#,
+        ),
+        (
+            "an overlong sequence in extra",
+            r#"{"number":7,"url":"https://h/7","extra":"\300\257"}"#,
+        ),
+    ] {
+        let f = raw_publisher(format).await;
+        let result = result_of(&f.results().await[0]);
+        assert_eq!(result.outcome, "error", "{field}");
+        assert!(!result.capture_present, "{field}");
+        assert_eq!(result.destination_stage, "failed", "{field}");
+        no_publication(&f.payload().await);
+        assert!(f.reviews().await.is_empty(), "{field}");
+        assert_eq!(
+            f.command_notes().await,
+            [Some(
+                "open_review output rejected: output is not valid UTF-8".to_string()
+            )],
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_unicode_that_looks_like_the_repair_character_is_accepted_as_printed() {
+    // U+FFFD written as its real UTF-8 bytes, plus a JSON-escaped control
+    // character and a multi-byte letter: all valid, all kept as printed.
+    let f = raw_publisher(
+        r#"{"number":7,"url":"https://h/7","label":"\357\277\275 \303\251","extra":"\\u0001\\ufffd"}"#,
+    )
+    .await;
+    let result = result_of(&f.results().await[0]);
+    assert_eq!(result.outcome, "done");
+    assert_eq!(result.destination_stage, "finished");
+    let capture = &f.payload().await["stages"]["publish"];
+    assert_eq!(capture["label"], "\u{fffd} é");
+    assert_eq!(capture["extra"], "\u{1}\u{fffd}");
+    assert_eq!(f.reviews().await[0].label, "\u{fffd} é");
+}
+
+#[tokio::test]
+async fn an_ordinary_shell_stage_still_repairs_non_utf8_output() {
+    let f = Flow::new(
+        r#"name: lenient
+stages:
+  plain:
+    kind: shell
+    command: "printf 'a\\377b'"
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+    )
+    .await;
+    f.start().await;
+    f.wait_stage("finished").await;
+    assert_eq!(f.payload().await["stages"]["plain"], "a\u{fffd}b");
 }
 
 // ---- atomic departure ---------------------------------------------------

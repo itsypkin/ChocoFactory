@@ -314,7 +314,15 @@ impl WorkflowEngine {
         let (captured, mut note) = if outcome.succeeded() && publishes_review {
             // A publisher's success is its answer: a command that exited 0
             // without printing a review reference did not publish one.
-            match validate_review_output(&outcome.stdout) {
+            let checked = if outcome.stdout_is_exact {
+                validate_review_output(&outcome.stdout)
+            } else {
+                // `outcome.stdout` has U+FFFD where the command wrote bytes
+                // that are not UTF-8; parsing it would accept text the
+                // command never printed.
+                Err("output is not valid UTF-8".to_string())
+            };
+            match checked {
                 Ok(review) => (Some(review), None),
                 Err(reason) => {
                     stage_outcome = "error";
@@ -449,6 +457,23 @@ mod tests {
             ok(&format!(r#"{{"number":{},"url":"{GITHUB}"}}"#, u64::MAX))["number"],
             json!(u64::MAX)
         );
+    }
+
+    #[test]
+    fn numbers_outside_f64_and_64_bit_range_are_kept_digit_for_digit() {
+        let printed = r#"{"number":7,"url":"https://h/7","pos":18446744073709551617,"neg":-9223372036854775809,"deep":{"a":[123456789012345678901234567890,{"b":-12345678901234567890123.5}]},"ratio":1.10}"#;
+        let capture = ok(printed);
+        assert_eq!(capture["pos"].to_string(), "18446744073709551617");
+        assert_eq!(capture["neg"].to_string(), "-9223372036854775809");
+        assert_eq!(
+            capture["deep"]["a"][0].to_string(),
+            "123456789012345678901234567890"
+        );
+        assert_eq!(
+            capture["deep"]["a"][1]["b"].to_string(),
+            "-12345678901234567890123.5"
+        );
+        assert_eq!(capture["ratio"].to_string(), "1.10");
     }
 
     #[test]

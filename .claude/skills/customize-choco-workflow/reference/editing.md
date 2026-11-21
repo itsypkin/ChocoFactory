@@ -107,13 +107,15 @@ They are filled in in: the contents of a `prompt_file`, an inline `command:`
 of a shell stage, `open_review` stage, poll stage or watcher, and every `env:`
 value. They are
 not filled in in a `system_prompt_file` or a `script_file`. A reference to
-an unknown stage, or to a stage without `capture:`, is rejected at load. A
+an unknown stage, or to a stage without a capture (declared with `capture:`,
+or implied, as an `open_review` stage's is), is rejected at load. A
 value that doesn't exist yet renders empty. A literal `{{` can't be written
 in these places.
 
 The capture of an agent-turn stage is removed when a new attempt of that stage
 launches (a shell, `open_review`, poll or human-gate stage keeps its last
-capture; an `open_review` stage's is always the JSON object it printed), so
+capture; an `open_review` stage's is always the JSON object it printed, with `label`
+filled in as `#<number>` when it printed none), so
 `{{ stages.<stage>.summary }}` in that stage's own prompt shows the previous
 lap's text on the first prompt it renders and delivers, and a later fresh
 re-render (`choco task retry --fresh`, or recovery after a crash before the

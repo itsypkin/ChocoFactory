@@ -742,7 +742,13 @@ When the command exits `0`, its whole standard output must be one JSON object:
 - `label` is optional: a nonempty string on a single line. Without one, choco
   records `#<number>`, so after a successful publication `label` is always
   there. A label you give is kept exactly as printed.
-- Every other field is kept as printed.
+- Every other field is kept as printed, numbers included: a number of any
+  size keeps every digit it was printed with (an exponent may be respelled,
+  such as `1e5` as `1e+5`, with the same value).
+- The output must be valid UTF-8. A command that prints other bytes (even
+  inside a string) fails the stage, because the bytes can't be told apart from
+  text without changing them. A real U+FFFD character, written as its UTF-8
+  bytes, is fine.
 - The output, trimmed, may be at most 1 MiB, and nothing may come before or
   after the object (no prose, no code fence, no second object).
 
@@ -750,7 +756,8 @@ Output that breaks a rule is a failure of the stage with the reason on the
 timeline (`open_review output rejected: …`). The stage takes its `error` edge,
 or, without one, the task parks as stuck at the stage. A command that exits
 non-zero, is killed, times out or can't be started fails as a `shell` stage
-does, and its output isn't read.
+does: its output is not recorded as a new capture (the timeline still keeps
+the tail of what it printed), so the previous publication stays.
 
 ### What choco records
 
@@ -777,9 +784,15 @@ again.
 
 ### Upgrading
 
-On upgrade, a task whose first captured stage held a `/pull/<number>` URL keeps
-that link once, as its review (the stage becomes the pointed stage and gets
-`number` and `label` from the URL). A custom workflow that publishes from a
+On upgrade, a task keeps one link it already had, as its review. choco takes
+the first stage, in the order the payload stores them, whose capture is an
+object with a `url` containing `/pull/`. That stage becomes the pointed stage
+and gets `number` and `label` from the URL, if the URL ends in
+`/pull/<number>`, with a lowercase `pull`, 1 to 18 digits, a number above zero
+and at most one trailing `/`. A task whose first such stage fails that test
+(for example `/pull/0`, a number of 19 or more digits, or a stage name that
+contains a `"`) gets no pointed review: choco doesn't look further down the
+list, and doesn't change that task's payload. A custom workflow that publishes from a
 `kind: shell` stage must change that stage to `kind: open_review`, and have the
 script print the object above, to keep showing a link for new tasks. choco does
 not bundle a GitLab command.
