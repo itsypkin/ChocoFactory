@@ -1110,9 +1110,9 @@ fn open_pr(app: &mut App) -> Vec<Effect> {
     };
     let pr = app
         .find(&id)
-        .and_then(|t| t.pr.clone())
+        .and_then(|t| t.reviews.first().cloned())
         .or_else(|| match &app.view {
-            View::Detail(d) => d.snapshot.as_ref().and_then(|t| t.pr.clone()),
+            View::Detail(d) => d.snapshot.as_ref().and_then(|t| t.reviews.first().cloned()),
             View::List => None,
         });
     let Some(pr) = pr else {

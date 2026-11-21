@@ -405,7 +405,7 @@ pub struct InFlight {
     pub task_id: String,
     pub title: String,
     pub stage: String,
-    /// `"agent_turn"`, `"shell"`, the comma-separated kinds of a parallel
+    /// `"agent_turn"`, `"shell"`, `"open_review"`, the comma-separated kinds of a parallel
     /// group's running branches, or `"unknown"` when the task's workflow
     /// could not be loaded or no longer has the stage.
     pub kind: String,
@@ -974,7 +974,9 @@ pub struct TaskSummary {
     pub stage_entered_at: Option<DateTime<Utc>>,
     /// `{}` when the task has no workflow_state row.
     pub loop_counters: Value,
-    pub pr: Option<PullRequestRef>,
+    /// The task's published review: zero or one, from the stage its
+    /// `review_stage` pointer names.
+    pub reviews: Vec<ReviewRef>,
     /// The task is open and its current stage is a `human_gate` (#175).
     #[serde(default)]
     pub waiting_on_human: bool,
@@ -1007,10 +1009,47 @@ pub struct UsageTotal {
     pub turns_without_cost: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PullRequestRef {
+/// The key of `workflow_state.payload` that names the stage whose capture is
+/// the task's review (the workflow's `open_review` stage). One writer: the
+/// departure of that stage; the payload keeps no second copy of the review.
+pub const REVIEW_STAGE_KEY: &str = "review_stage";
+
+/// A task's published review, as read from the capture of the stage
+/// `review_stage` points at. The engine knows nothing of any forge: the
+/// reference is whatever the publishing script printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRef {
+    /// The stage that published it.
+    pub stage: String,
     pub number: u64,
     pub url: String,
+    /// What to call the review: the script's `label`, or `#<number>`.
+    pub label: String,
+}
+
+/// Reads the review a stage captured. `None` unless `capture` is an object
+/// with a positive integer `number` and a string `url`. A nonempty string
+/// `label` is used as is; anything else falls back to `#<number>`.
+///
+/// Deliberately more forgiving than the publication contract the engine
+/// enforces on the way in: it never reinterprets the URL or the label, so a
+/// reference that was valid when recorded stays readable.
+pub fn review_ref(stage: &str, capture: &Value) -> Option<ReviewRef> {
+    let number = capture
+        .get("number")?
+        .as_u64()
+        .filter(|number| *number > 0)?;
+    let url = capture.get("url")?.as_str()?.to_string();
+    let label = match capture.get("label").and_then(Value::as_str) {
+        Some(label) if !label.is_empty() => label.to_string(),
+        _ => format!("#{number}"),
+    };
+    Some(ReviewRef {
+        stage: stage.to_string(),
+        number,
+        url,
+        label,
+    })
 }
 
 #[cfg(test)]

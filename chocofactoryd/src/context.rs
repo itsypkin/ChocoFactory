@@ -890,7 +890,7 @@ mod tests {
             assert!(!format!("{answer:?}").contains("PRIVATE-CAPTURE"));
         }
 
-        // The five kinds a task can leave are each readable, in the same
+        // The six kinds a task can leave are each readable, in the same
         // positions.
         let task = new_task_in(&pool, "kinds-ok", &[]).await;
         put_state(&pool, &task, json!({})).await;

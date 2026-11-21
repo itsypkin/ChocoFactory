@@ -3633,6 +3633,25 @@ impl WorkflowEngine {
             // Keyed by the stage that produced it, which the caller has
             // confirmed is still the current one.
             merge_stage_capture(&mut payload, &from_stage, value);
+            // A review publisher's capture is the task's review: point at
+            // it in this same payload, so the pointer commits with the
+            // capture and the departure, never in a statement of its own.
+            // Only the publisher's runner supplies a capture, and only for
+            // output it validated; a failed lap supplies none, which leaves
+            // the previous pointer standing.
+            if matches!(
+                stage_def.kind,
+                StageKind::Shell {
+                    publishes_review: true,
+                    ..
+                }
+            ) && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    chocofactory_core::models::REVIEW_STAGE_KEY.to_string(),
+                    Value::String(from_stage.clone()),
+                );
+            }
         }
         // Records how the task arrived at `next_stage`, so
         // `coder-revise.md` and any other template can branch on

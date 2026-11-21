@@ -13,8 +13,9 @@ pub fn matches(task: &TaskSummary, query: &str) -> bool {
     let q = query.trim();
     let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let pr_is = |t: &TaskSummary, digits: &str| {
-        t.pr.as_ref()
-            .is_some_and(|pr| pr.number.to_string() == digits)
+        t.reviews
+            .first()
+            .is_some_and(|review| review.number.to_string() == digits)
     };
     let lower = q.to_lowercase();
     if q.is_empty() {
@@ -45,7 +46,7 @@ pub fn search<'a>(tasks: &'a [TaskSummary], query: &str) -> Vec<&'a TaskSummary>
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use chocofactory_core::models::{PullRequestRef, Task};
+    use chocofactory_core::models::{ReviewRef, Task};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
@@ -75,10 +76,15 @@ pub(crate) mod tests {
             current_stage: None,
             stage_entered_at: None,
             loop_counters: json!({}),
-            pr: pr.map(|number| PullRequestRef {
-                number,
-                url: format!("https://x/pull/{number}"),
-            }),
+            reviews: pr
+                .map(|number| ReviewRef {
+                    stage: "open_pr".into(),
+                    number,
+                    url: format!("https://x/pull/{number}"),
+                    label: format!("#{number}"),
+                })
+                .into_iter()
+                .collect(),
             waiting_on_human: false,
             usage_total: None,
             branch_progress: None,

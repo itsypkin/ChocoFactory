@@ -31,6 +31,9 @@ pub async fn connect_in_memory() -> Result<SqlitePool, sqlx::Error> {
 }
 
 #[cfg(test)]
+mod review_migration;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

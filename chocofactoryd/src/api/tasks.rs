@@ -9,7 +9,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chocofactory_core::context::ContextResponse;
 use chocofactory_core::models::{
-    Event, PauseOutcome, ResumeOutcome, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState,
+    Event, PauseOutcome, REVIEW_STAGE_KEY, ResumeOutcome, RetryMode, RetryOutcome, ReviewRef, Task,
+    TaskSummary, WorkflowState, review_ref,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -161,6 +162,9 @@ pub struct TaskDetail {
     #[serde(flatten)]
     pub task: Task,
     pub workflow_state: Option<WorkflowState>,
+    /// The task's published review — zero or one, the same as
+    /// `GET /tasks` reports for the row.
+    pub reviews: Vec<ReviewRef>,
     /// Every stage this task has entered, oldest first — the replacement
     /// for `workflow_state.stage_history`, which X-3 removed in favour of
     /// the events timeline. Served from here rather than left to the caller
@@ -188,6 +192,22 @@ pub struct TaskDetail {
     pub watch_timed_out: Option<crate::engine::WatchTimedOutInfo>,
     /// The task's turns waiting for a slot; empty when none is.
     pub queued: Vec<chocofactory_core::models::QueuedTurn>,
+}
+
+/// The review the payload's `review_stage` pointer names: the capture of that
+/// stage, read the way `GET /tasks` reads it. A missing or mistyped pointer,
+/// `stages` or capture means no review, never a lookup anywhere else.
+fn reviews_of(payload: &Value) -> Vec<ReviewRef> {
+    let Some(stage) = payload.get(REVIEW_STAGE_KEY).and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    payload
+        .get("stages")
+        .and_then(Value::as_object)
+        .and_then(|stages| stages.get(stage))
+        .and_then(|capture| review_ref(stage, capture))
+        .into_iter()
+        .collect()
 }
 
 /// The worktree path and branch a `cancel --keep` handed to a person.
@@ -394,7 +414,12 @@ pub async fn get(
         None => None,
     };
     let queued = state.engine.queue_snapshot().await?.queued_for(&id);
+    let reviews = workflow_state
+        .as_ref()
+        .map(|ws| reviews_of(&ws.payload))
+        .unwrap_or_default();
     Ok(Json(TaskDetail {
+        reviews,
         queued,
         usage,
         watch_timed_out,

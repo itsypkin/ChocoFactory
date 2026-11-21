@@ -585,7 +585,7 @@ mod tests {
             "workflow_path": null, "workflow_sha256": null,
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
             "current_stage": null, "stage_entered_at": null, "loop_counters": {},
-            "pr": null, "usage_total": usage_total,
+            "reviews": [], "usage_total": usage_total,
         }))
         .unwrap()
     }
