@@ -742,9 +742,12 @@ When the command exits `0`, its whole standard output must be one JSON object:
 - `label` is optional: a nonempty string on a single line. Without one, choco
   records `#<number>`, so after a successful publication `label` is always
   there. A label you give is kept exactly as printed.
-- Every other field is kept as printed, numbers included: a number of any
-  size keeps every digit it was printed with (an exponent may be respelled,
-  such as `1e5` as `1e+5`, with the same value).
+- Every other field is kept as printed, and objects stay objects, whatever
+  their keys. A number is kept with its value, though it may be respelled
+  (`1.10` as `1.1`, `1e5` as `100000.0`). One that choco can't store exactly,
+  because it is outside the 64-bit integers and has more digits than a
+  double holds (`18446744073709551617`, or `0.1000000000000000055511151231257827`),
+  is not rounded: it fails the stage. Print such a value as a string.
 - The output must be valid UTF-8. A command that prints other bytes (even
   inside a string) fails the stage, because the bytes can't be told apart from
   text without changing them. A real U+FFFD character, written as its UTF-8

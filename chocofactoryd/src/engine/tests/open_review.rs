@@ -672,22 +672,22 @@ stages:
 }
 
 #[tokio::test]
-async fn numbers_the_script_printed_are_kept_digit_for_digit_everywhere() {
-    // Each of these is changed by an f64 or a 64-bit round trip.
+async fn numbers_and_marker_shaped_objects_survive_every_read_unchanged() {
+    // Large exact numbers, and objects shaped like serde_json's private number
+    // marker (which `arbitrary_precision` would turn into numbers).
     let f = Flow::new(
         r#"name: review-numbers
 stages:
   publish:
     kind: open_review
     command: |
-      printf '%s' '{"number":7,"url":"https://github.com/o/r/pull/7","big":18446744073709551617,"neg":-9223372036854775809,"deep":{"list":[123456789012345678901234567890,{"x":-170141183460469231731687303715884105729}]},"ratio":1.10,"tiny":0.1000000000000000055511151231257827}'
+      printf '%s' '{"number":7,"url":"https://github.com/o/r/pull/7","max":18446744073709551615,"min":-9223372036854775808,"ratio":1.5,"marker":{"$serde_json::private::Number":"42"},"deep":[{"$serde_json::private::Number":"1","more":2}]}'
     on: { done: render }
   render:
     kind: shell
-    command: 'printf "%s %s" "$R_BIG" "$R_NEG"'
+    command: 'printf "%s" "$R_MAX"'
     env:
-      R_BIG: "{{ stages.publish.big }}"
-      R_NEG: "{{ stages.publish.neg }}"
+      R_MAX: "{{ stages.publish.max }}"
     capture: text
     on: { done: finished }
   finished:
@@ -699,32 +699,28 @@ stages:
     f.wait_stage("finished").await;
 
     let exact = |capture: &Value| {
-        assert_eq!(capture["big"].to_string(), "18446744073709551617");
-        assert_eq!(capture["neg"].to_string(), "-9223372036854775809");
+        assert_eq!(capture["max"].to_string(), "18446744073709551615");
+        assert_eq!(capture["min"].to_string(), "-9223372036854775808");
+        assert_eq!(capture["ratio"].to_string(), "1.5");
         assert_eq!(
-            capture["deep"]["list"][0].to_string(),
-            "123456789012345678901234567890"
+            capture["marker"],
+            json!({"$serde_json::private::Number": "42"})
         );
         assert_eq!(
-            capture["deep"]["list"][1]["x"].to_string(),
-            "-170141183460469231731687303715884105729"
+            capture["deep"],
+            json!([{"$serde_json::private::Number": "1", "more": 2}])
         );
-        assert_eq!(capture["ratio"].to_string(), "1.10");
-        assert_eq!(
-            capture["tiny"].to_string(),
-            "0.1000000000000000055511151231257827"
-        );
-        assert_eq!(capture["number"].to_string(), "7");
     };
     // The persisted payload the later stages and the API read...
     exact(&f.payload().await["stages"]["publish"]);
-    // ...the history the stage result carries...
+    // ...and the history the stage result carries.
     let results = f.results().await;
     exact(&result_of(&results[0]).capture);
-    // ...and what a template hands to a later command.
+    assert_eq!(f.reviews().await.len(), 1);
+    // The template reads the same number back.
     assert_eq!(
         f.payload().await["stages"]["render"],
-        "18446744073709551617 -9223372036854775809"
+        "18446744073709551615"
     );
 }
 
@@ -739,6 +735,60 @@ async fn raw_publisher(format: &str) -> Flow {
     f.start().await;
     f.wait_first_result().await;
     f
+}
+
+#[tokio::test]
+async fn a_number_the_stored_value_would_round_is_rejected_with_no_publication() {
+    for printed in [
+        r#"{"number":7,"url":"https://h/7","big":18446744073709551617}"#,
+        r#"{"number":7,"url":"https://h/7","deep":{"x":[-12345678901234567890123.5]}}"#,
+    ] {
+        let f = raw_publisher(printed).await;
+        let result = result_of(&f.results().await[0]);
+        assert_eq!(result.outcome, "error", "{printed}");
+        assert!(!result.capture_present, "{printed}");
+        assert_eq!(result.destination_stage, "failed", "{printed}");
+        no_publication(&f.payload().await);
+        assert!(f.reviews().await.is_empty(), "{printed}");
+        let notes = f.command_notes().await;
+        assert!(
+            notes[0].as_deref().is_some_and(|note| note
+                .starts_with("open_review output rejected: number ")
+                && note.contains("does not fit a 64-bit integer or double exactly")),
+            "{notes:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_ordinary_shell_keeps_its_text_fallback_for_an_out_of_range_number() {
+    // serde_json refuses 1e400, so a `capture: json` shell has always fallen
+    // back to the printed text. The publisher's number handling must not move
+    // that: the same stage kind, in one workflow, beside a publisher.
+    let f = Flow::new(
+        r#"name: legacy-json
+stages:
+  publish:
+    kind: open_review
+    command: |
+      printf '%s' '{"number":7,"url":"https://github.com/o/r/pull/7"}'
+    on: { done: plain }
+  plain:
+    kind: shell
+    command: "printf '%s' '{\"extra\":1e400,\"marker\":{\"$serde_json::private::Number\":\"9\"}}'"
+    capture: json
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+    )
+    .await;
+    f.start().await;
+    f.wait_stage("finished").await;
+    assert_eq!(
+        f.payload().await["stages"]["plain"],
+        r#"{"extra":1e400,"marker":{"$serde_json::private::Number":"9"}}"#
+    );
 }
 
 #[tokio::test]

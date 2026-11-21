@@ -97,6 +97,12 @@ pub(super) fn validate_review_output(stdout: &str) -> Result<Value, String> {
     if url.chars().any(char::is_whitespace) {
         return Err("`url` must contain no whitespace".to_string());
     }
+    if let Some(token) = first_inexact_number(trimmed) {
+        return Err(format!(
+            "number {token} does not fit a 64-bit integer or double exactly, so storing \
+             it would change it; print it as a string"
+        ));
+    }
     match object.get("label") {
         None => {
             object.insert("label".to_string(), Value::String(format!("#{number}")));
@@ -106,6 +112,80 @@ pub(super) fn validate_review_output(stdout: &str) -> Result<Value, String> {
         Some(_) => return Err("`label` must be a nonempty single-line string".to_string()),
     }
     Ok(Value::Object(object))
+}
+
+/// The first number token in `json` (a document `serde_json` already parsed)
+/// that parsing into a [`Value`] would change: one that is neither an `i64` or
+/// `u64` nor the shortest spelling of an `f64`. `Value` holds no other number,
+/// so such a token would be rounded; a publisher's output is refused instead.
+/// Respellings of the same value (`1.10` as `1.1`, `1e5` as `100000.0`) pass.
+///
+/// Reads the text rather than the `Value`: serde_json's `arbitrary_precision`
+/// feature would keep the digits, but it is process-wide, turns an object whose
+/// first key is `$serde_json::private::Number` into a number, and changes how
+/// every other capture parses.
+fn first_inexact_number(json: &str) -> Option<&str> {
+    let bytes = json.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let token = &json[start..i];
+                if !number_survives_parsing(token) {
+                    return Some(token);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn number_survives_parsing(token: &str) -> bool {
+    if token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok() {
+        return true;
+    }
+    let Ok(float) = token.parse::<f64>() else {
+        return false;
+    };
+    float.is_finite() && decimal_parts(token) == decimal_parts(&format!("{float:e}"))
+}
+
+/// `(negative, digits, exponent)` with the value `0.<digits> × 10^exponent`
+/// ignoring leading and trailing zeros, so spellings of one value compare
+/// equal; zero is `(false, "", 0)`. `None` for a token this can't read.
+fn decimal_parts(token: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let exponent = exponent.checked_add(whole.len() as i64)?;
+    let significant = digits.trim_start_matches('0');
+    let exponent = exponent - (digits.len() - significant.len()) as i64;
+    let significant = significant.trim_end_matches('0');
+    if significant.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    Some((negative, significant.to_string(), exponent))
 }
 
 /// How a command is named on the timeline. A `script_file` shows its path;
@@ -460,20 +540,73 @@ mod tests {
     }
 
     #[test]
-    fn numbers_outside_f64_and_64_bit_range_are_kept_digit_for_digit() {
-        let printed = r#"{"number":7,"url":"https://h/7","pos":18446744073709551617,"neg":-9223372036854775809,"deep":{"a":[123456789012345678901234567890,{"b":-12345678901234567890123.5}]},"ratio":1.10}"#;
-        let capture = ok(printed);
-        assert_eq!(capture["pos"].to_string(), "18446744073709551617");
-        assert_eq!(capture["neg"].to_string(), "-9223372036854775809");
+    fn numbers_a_value_would_change_are_rejected_not_rounded() {
+        for (printed, token) in [
+            (r#""pos":18446744073709551617"#, "18446744073709551617"),
+            (r#""neg":-9223372036854775809"#, "-9223372036854775809"),
+            (
+                r#""deep":{"a":[1,{"b":-12345678901234567890123.5}]}"#,
+                "-12345678901234567890123.5",
+            ),
+            (
+                r#""tiny":0.1000000000000000055511151231257827"#,
+                "0.1000000000000000055511151231257827",
+            ),
+            (
+                r#""list":[1,2,123456789012345678901234567890]"#,
+                "123456789012345678901234567890",
+            ),
+        ] {
+            rejected(
+                &format!(r#"{{"number":7,"url":"https://h/7",{printed}}}"#),
+                &format!("number {token} does not fit"),
+            );
+        }
+        // `number` keeps its own rule's message.
+        rejected(
+            r#"{"number":18446744073709551617,"url":"https://h/7"}"#,
+            "`number` must be a positive integer",
+        );
+    }
+
+    #[test]
+    fn numbers_a_value_keeps_and_text_that_only_looks_like_one_are_accepted() {
+        let printed = format!(
+            r#"{{"number":7,"url":"https://h/7","max":{},"min":{},"ratio":1.10,"exp":1e5,"neg":-2.5E-3,"zero":-0.0,"deep":{{"a":[0.1,{{"b":1e300}}]}},"text":"18446744073709551617 and \" 99999999999999999999","99999999999999999999":true,"flag":false}}"#,
+            u64::MAX,
+            i64::MIN
+        );
+        let capture = ok(&printed);
+        assert_eq!(capture["max"], json!(u64::MAX));
+        assert_eq!(capture["min"], json!(i64::MIN));
+        assert_eq!(capture["ratio"], json!(1.1));
+        assert_eq!(capture["exp"], json!(100000.0));
+        assert_eq!(capture["deep"]["a"][1]["b"], json!(1e300));
         assert_eq!(
-            capture["deep"]["a"][0].to_string(),
-            "123456789012345678901234567890"
+            capture["text"],
+            "18446744073709551617 and \" 99999999999999999999"
+        );
+        assert_eq!(capture["99999999999999999999"], true);
+    }
+
+    #[test]
+    fn an_object_shaped_like_serde_jsons_number_marker_stays_an_object() {
+        let capture = ok(
+            r#"{"number":7,"url":"https://h/7","extra":{"$serde_json::private::Number":"42"},"list":[{"$serde_json::private::Number":"1"}]}"#,
         );
         assert_eq!(
-            capture["deep"]["a"][1]["b"].to_string(),
-            "-12345678901234567890123.5"
+            capture["extra"],
+            json!({"$serde_json::private::Number": "42"})
         );
-        assert_eq!(capture["ratio"].to_string(), "1.10");
+        assert_eq!(
+            capture["list"][0],
+            json!({"$serde_json::private::Number": "1"})
+        );
+        // And in a required field it is a wrong type, not a number.
+        rejected(
+            r#"{"number":{"$serde_json::private::Number":"7"},"url":"https://h/7"}"#,
+            "`number` must be a positive integer",
+        );
     }
 
     #[test]
