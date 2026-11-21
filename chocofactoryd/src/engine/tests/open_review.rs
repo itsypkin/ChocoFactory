@@ -107,6 +107,18 @@ impl Flow {
         wait_until_stage(&self.pool, &self.task_id, stage).await;
     }
 
+    /// Waits for the task's first departure, wherever it led.
+    async fn wait_first_result(&self) {
+        crate::test_support::wait_until("the first stage result", || async {
+            if self.results().await.is_empty() {
+                Err("none yet".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+    }
+
     async fn wait_status(&self, status: &str) {
         wait_until_task_status(&self.pool, &self.task_id, status).await;
     }
@@ -227,7 +239,7 @@ fn github(number: u64) -> ReviewRef {
 async fn invalid_publisher_output_follows_the_error_edge_and_publishes_nothing() {
     let f = Flow::publisher("echo 'opened it'", "{ done: finished, error: failed }").await;
     f.start().await;
-    f.wait_stage("failed").await;
+    f.wait_first_result().await;
 
     let results = f.results().await;
     assert_eq!(results.len(), 1, "{results:?}");
