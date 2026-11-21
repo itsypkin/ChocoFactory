@@ -550,6 +550,63 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
 }
 
 #[tokio::test]
+async fn a_failed_lap_leaves_the_previous_publication_exactly_as_it_was() {
+    let f = Flow::new(
+        r#"name: review-failing
+stages:
+  publish:
+    kind: open_review
+    script_file: publish.sh
+    on: { done: finished, error: failed }
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: { resumed: finished }
+"#,
+    )
+    .await;
+    // Waits for `go`, then prints another valid reference and fails.
+    f.script(
+        "publish.sh",
+        "while [ ! -f go ]; do sleep 0.05; done\nprintf '{\"number\":99,\"url\":\"https://github.com/o/r/pull/99\"}'\nexit 1\n",
+    );
+    f.start().await;
+    // An earlier lap published #1.
+    let mut state = f.state().await;
+    state.payload[REVIEW_STAGE_KEY] = json!("publish");
+    state.payload["stages"] =
+        json!({"publish": {"number": 1, "url": "https://github.com/o/r/pull/1", "label": "#1"}});
+    workflow_state::update(
+        &f.pool,
+        &f.task_id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage,
+            stage_kind: state.stage_kind.unwrap(),
+            loop_counters: state.loop_counters,
+            payload: state.payload.clone(),
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.reviews().await, [github(1)]);
+
+    f.write("go", "");
+    f.wait_first_result().await;
+    // The lap is an error with no capture, and #1 is still the review.
+    let lap = result_of(&f.results().await[0]);
+    assert_eq!(
+        (lap.outcome.as_str(), lap.capture_present),
+        ("error", false)
+    );
+    assert_eq!(f.reviews().await, [github(1)]);
+    let after = f.payload().await;
+    assert_eq!(after["stages"], state.payload["stages"]);
+    assert_eq!(after[REVIEW_STAGE_KEY], "publish");
+}
+
+#[tokio::test]
 async fn github_and_self_hosted_publications_read_back_identically_in_list_and_detail() {
     for (printed, expected) in [
         (
