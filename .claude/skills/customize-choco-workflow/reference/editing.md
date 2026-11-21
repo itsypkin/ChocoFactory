@@ -24,9 +24,15 @@ where a task starts.
 |---|---|
 | `agent_turn` | `role`, `prompt_file`, `capture`, `report_sections` |
 | `shell` | `command` or `script_file` (exactly one), `capture`, `timeout`, `env` |
+| `open_review` | `command` or `script_file` (exactly one), `timeout`, `env`; no `capture` (always JSON) |
 | `poll` | `command` or `script_file`, `capture`, `env`, `interval` (required), `backoff`, `timeout`, `outcomes` |
 | `human_gate` | `capture` (`text` only), `markers`, `watch` |
 | `terminal` | none, and no `on:` |
+
+`open_review` is a `shell` stage that publishes the task's review: its output
+must be a JSON object with `number` and `url`, and a workflow has at most one.
+See [publishing a review](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#publishing-a-review-open_review)
+for the rules and for what a retry must tolerate.
 
 A misspelt stage key or role field is rejected when the workflow loads. A
 misspelt top-level key is not: only `name`, `roles`, `stages` and
@@ -98,14 +104,16 @@ and nothing else:
   (`YYYY-MM-DDTHH:MM:SSZ`, UTC). Empty if it has never left it.
 
 They are filled in in: the contents of a `prompt_file`, an inline `command:`
-of a shell stage, poll stage or watcher, and every `env:` value. They are
+of a shell stage, `open_review` stage, poll stage or watcher, and every `env:`
+value. They are
 not filled in in a `system_prompt_file` or a `script_file`. A reference to
 an unknown stage, or to a stage without `capture:`, is rejected at load. A
 value that doesn't exist yet renders empty. A literal `{{` can't be written
 in these places.
 
 The capture of an agent-turn stage is removed when a new attempt of that stage
-launches (a shell, poll or human-gate stage keeps its last capture), so
+launches (a shell, `open_review`, poll or human-gate stage keeps its last
+capture; an `open_review` stage's is always the JSON object it printed), so
 `{{ stages.<stage>.summary }}` in that stage's own prompt shows the previous
 lap's text on the first prompt it renders and delivers, and a later fresh
 re-render (`choco task retry --fresh`, or recovery after a crash before the
