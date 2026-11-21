@@ -479,7 +479,6 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
         .await
         .unwrap();
     let (script, sleeper) = hang_started(&f, "t1").await;
-    assert_eq!(f.state().await.stage_kind.as_deref(), Some("open_review"));
     assert_eq!(f.reviews().await, [github(1)]);
     f.wait_settled(8, "gate").await;
     assert_eq!(f.reviews().await, [github(1)]);
@@ -533,6 +532,9 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
         assert_eq!(entry["kind"], kind, "{entry}");
     }
     assert!(entered.iter().any(|e| e["stage"] == "publish"));
+    // The cancelled lap left the task at the publisher.
+    assert_eq!(f.state().await.current_stage, "publish");
+    assert_eq!(f.state().await.stage_kind.as_deref(), Some("open_review"));
 }
 
 #[tokio::test]
@@ -647,13 +649,18 @@ async fn assert_departure_refused(f: &Flow, trigger: &str) {
     f.wait_status("stuck").await;
 
     let after = departure_facts(f).await;
-    assert_eq!(after.0.current_stage, "publish");
     assert!(
         after.0.payload.get(REVIEW_STAGE_KEY).is_none(),
-        "{}",
+        "no review pointer: {}",
         after.0.payload
     );
-    assert!(after.0.payload["stages"].get("publish").is_none());
+    assert!(
+        after.0.payload["stages"].get("publish").is_none(),
+        "no publisher capture"
+    );
+    assert_eq!(after.1, before.1, "no stage result");
+    assert_eq!(after.0.current_stage, "publish");
+    assert_eq!(after.2, before.2, "no destination entered");
     assert_eq!(after, before, "nothing about the departure was recorded");
     assert!(f.reviews().await.is_empty());
     let task = tasks::get(&f.pool, &f.task_id).await.unwrap().unwrap();
@@ -781,7 +788,7 @@ async fn pruning_the_publications_event_keeps_the_review_and_reports_a_history_g
         );
         listed
     };
-    assert_eq!(reviews_now().await, [expected.clone()]);
+    assert_eq!(reviews_now().await, std::slice::from_ref(&expected));
 
     // Only the publication's event is old; the later anchor points through it.
     sqlx::query("UPDATE events SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = ?")
