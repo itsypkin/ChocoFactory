@@ -746,10 +746,6 @@ When the command exits `0`, its whole standard output must be one JSON object:
   their keys. Extra fields are stored as JSON values the way choco parses them,
   so very large or very precise numbers may be rounded; a script that needs
   exact digits prints them as a string.
-- The output must be valid UTF-8. A command that prints other bytes (even
-  inside a string) fails the stage, because the bytes can't be told apart from
-  text without changing them. A real U+FFFD character, written as its UTF-8
-  bytes, is fine.
 - The output, trimmed, may be at most 1 MiB, and nothing may come before or
   after the object (no prose, no code fence, no second object).
 

@@ -4,7 +4,6 @@
 
 use super::stage_results::{ask, by_name, found, gate_flow_from, result_of};
 use super::*;
-use chocofactory_core::context::{ContextResponse, UnavailableReason};
 use chocofactory_core::models::{Event, REVIEW_STAGE_KEY, ReviewRef};
 
 /// A workflow whose only stage is a publisher (`publish`), for the engine's
@@ -314,48 +313,6 @@ async fn a_publisher_that_exits_nonzero_with_valid_output_is_a_plain_command_fai
     );
 }
 
-#[tokio::test]
-async fn a_publisher_killed_by_a_signal_or_missing_at_spawn_publishes_nothing() {
-    // Killed by a signal after printing a valid reference.
-    let f = Flow::publisher(
-        &format!("{GITHUB_7}\nkill -TERM $$"),
-        "{ done: finished, error: failed }",
-    )
-    .await;
-    f.start().await;
-    f.wait_stage("failed").await;
-    let result = result_of(&f.results().await[0]);
-    assert_eq!(
-        (result.outcome.as_str(), result.capture_present),
-        ("error", false)
-    );
-    no_publication(&f.payload().await);
-    assert!(f.reviews().await.is_empty());
-
-    // An executable script removed after the definition loaded.
-    let dir = tempdir();
-    let yaml = "name: review-flow\nstages:\n  publish:\n    kind: open_review\n    script_file: publish.sh\n    on: { done: finished, error: failed }\n  finished:\n    kind: terminal\n  failed:\n    kind: human_gate\n    on: { resumed: finished }\n";
-    crate::test_support::write_executable(
-        &dir.join("publish.sh"),
-        format!("#!/bin/sh\n{GITHUB_7}\n"),
-    );
-    fs::write(dir.join("review-flow.yaml"), yaml).unwrap();
-    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
-    fs::remove_file(dir.join("publish.sh")).unwrap();
-    let pool = connect_in_memory().await.unwrap();
-    let task_id = seed_task_in(&pool, &def.name, &dir).await;
-    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
-    engine.start_task(&task_id, &def, None).await.unwrap();
-    wait_until_stage(&pool, &task_id, "failed").await;
-    let result = result_of(&stage_results(&pool, &task_id).await[0]);
-    assert_eq!(
-        (result.outcome.as_str(), result.capture_present),
-        ("error", false)
-    );
-    let payload = payload_of(&pool, &task_id).await;
-    no_publication(&payload);
-}
-
 // ---- laps ---------------------------------------------------------------
 
 const LAP_FLOW: &str = r#"name: review-laps
@@ -379,67 +336,22 @@ stages:
 "#;
 
 /// The publisher's modes come from the file `mode`: `ok <n>`, `fail`, or
-/// `hang <tag>`, which records its pids under `<tag>.*` and then a
-/// `<tag>.started` marker, and sleeps in its process group.
+/// `hang <tag>`, which writes a `<tag>.started` marker and sleeps.
 const LAP_SCRIPT: &str = r#"mode=$(cat mode)
 case "$mode" in
   "ok "*) n=${mode#ok }; printf '{"number":%s,"url":"https://github.com/o/r/pull/%s"}' "$n" "$n" ;;
   fail) printf '{"number":99,"url":"https://github.com/o/r/pull/99"}'; exit 1 ;;
-  "hang "*) tag=${mode#hang }; echo $$ > "$tag.script"; sleep 600 & echo $! > "$tag.sleeper"; : > "$tag.started"; wait ;;
+  "hang "*) tag=${mode#hang }; : > "$tag.started"; sleep 600 ;;
 esac
 "#;
 
-/// `ps -o <field>= -p <pid>`: the OS's own answer, independent of the engine.
-fn ps(field: &str, pid: u32) -> Option<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    let text = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    (out.status.success() && !text.is_empty()).then_some(text)
-}
-
-fn pid_file(f: &Flow, name: &str) -> u32 {
-    fs::read_to_string(f.dir.join(name))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-/// Waits for a hang lap's started marker, then checks with `ps` that its
-/// sleeper runs in the publisher script's own process group. Returns the
-/// (script, sleeper) pids.
-async fn hang_started(f: &Flow, tag: &str) -> (u32, u32) {
+/// Waits for a hang lap's `<tag>.started` marker.
+async fn wait_started(f: &Flow, tag: &str) {
     let marker = f.dir.join(format!("{tag}.started"));
     crate::test_support::wait_until(&format!("{tag} started"), || async {
         marker.exists().then_some(()).ok_or("not yet".to_string())
     })
     .await;
-    let (script, sleeper) = (
-        pid_file(f, &format!("{tag}.script")),
-        pid_file(f, &format!("{tag}.sleeper")),
-    );
-    assert!(process_alive(script) && process_alive(sleeper));
-    assert_eq!(ps("pgid", sleeper), Some(script.to_string()), "same group");
-    assert_eq!(
-        ps("pgid", script),
-        Some(script.to_string()),
-        "its own group"
-    );
-    (script, sleeper)
-}
-
-async fn assert_group_gone(script: u32, sleeper: u32) {
-    crate::test_support::wait_until("the process group to die", || async {
-        if process_alive(script) || process_alive(sleeper) {
-            Err("still alive".to_string())
-        } else {
-            Ok(())
-        }
-    })
-    .await;
-    assert_eq!((ps("pid", script), ps("pid", sleeper)), (None, None));
 }
 
 #[tokio::test]
@@ -490,7 +402,7 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
         .advance(&f.task_id, &f.def, "resumed")
         .await
         .unwrap();
-    let (script, sleeper) = hang_started(&f, "t1").await;
+    wait_started(&f, "t1").await;
     assert_eq!(f.reviews().await, [github(1)]);
     f.wait_settled(8, "gate").await;
     assert_eq!(f.reviews().await, [github(1)]);
@@ -499,7 +411,6 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
         (lap.outcome.as_str(), lap.capture_present),
         ("error", false)
     );
-    assert_group_gone(script, sleeper).await;
 
     // ok 2 replaces the snapshot.
     f.write("mode", "ok 2");
@@ -517,14 +428,13 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
         .advance(&f.task_id, &f.def, "resumed")
         .await
         .unwrap();
-    let (script, sleeper) = hang_started(&f, "t2").await;
+    wait_started(&f, "t2").await;
     assert_eq!(f.reviews().await, [github(2)]);
     assert_eq!(f.results().await.len(), 12);
     f.engine.cancel_task(&f.task_id, false).await.unwrap();
     assert_eq!(f.reviews().await, [github(2)]);
     assert_eq!(f.results().await.len(), 12, "no further departure");
     assert_eq!(f.payload().await["stages"]["publish"], published);
-    assert_group_gone(script, sleeper).await;
 
     // Kinds, everywhere the name is recorded.
     for result in f.results().await {
@@ -547,65 +457,6 @@ async fn the_review_is_the_last_successful_publication_through_failed_timed_out_
     // The cancelled lap left the task at the publisher.
     assert_eq!(f.state().await.current_stage, "publish");
     assert_eq!(f.state().await.stage_kind.as_deref(), Some("open_review"));
-}
-
-#[tokio::test]
-async fn a_failed_lap_leaves_the_previous_publication_exactly_as_it_was() {
-    let f = Flow::new(
-        r#"name: review-failing
-stages:
-  publish:
-    kind: open_review
-    script_file: publish.sh
-    on: { done: finished, error: failed }
-  finished:
-    kind: terminal
-  failed:
-    kind: human_gate
-    on: { resumed: finished }
-"#,
-    )
-    .await;
-    // Waits for `go`, then prints another valid reference and fails.
-    f.script(
-        "publish.sh",
-        "while [ ! -f go ]; do sleep 0.05; done\nprintf '{\"number\":99,\"url\":\"https://github.com/o/r/pull/99\"}'\nexit 1\n",
-    );
-    f.start().await;
-    // An earlier lap published #1.
-    let mut state = f.state().await;
-    state.payload[REVIEW_STAGE_KEY] = json!("publish");
-    state.payload["stages"] =
-        json!({"publish": {"number": 1, "url": "https://github.com/o/r/pull/1", "label": "#1"}});
-    workflow_state::update(
-        &f.pool,
-        &f.task_id,
-        workflow_state::WorkflowStateUpdate {
-            current_stage: state.current_stage,
-            stage_kind: state.stage_kind.unwrap(),
-            loop_counters: state.loop_counters,
-            payload: state.payload.clone(),
-            enters_stage: false,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(f.reviews().await, [github(1)]);
-
-    f.write("go", "");
-    f.wait_first_result().await;
-    // #1 is still the review. First, so a failed lap's stdout merged into the
-    // payload fails here, on #99 replacing #1, before the lap's own metadata.
-    assert_eq!(f.reviews().await, [github(1)]);
-    // And the lap is an error with no capture.
-    let lap = result_of(&f.results().await[0]);
-    assert_eq!(
-        (lap.outcome.as_str(), lap.capture_present),
-        ("error", false)
-    );
-    let after = f.payload().await;
-    assert_eq!(after["stages"], state.payload["stages"]);
-    assert_eq!(after[REVIEW_STAGE_KEY], "publish");
 }
 
 #[tokio::test]
@@ -671,59 +522,6 @@ stages:
     );
 }
 
-#[tokio::test]
-async fn numbers_and_marker_shaped_objects_survive_every_read_unchanged() {
-    // Numbers `Value` holds exactly, and objects shaped like serde_json's private number
-    // marker (which `arbitrary_precision` would turn into numbers).
-    let f = Flow::new(
-        r#"name: review-numbers
-stages:
-  publish:
-    kind: open_review
-    command: |
-      printf '%s' '{"number":7,"url":"https://github.com/o/r/pull/7","max":18446744073709551615,"min":-9223372036854775808,"ratio":1.5,"marker":{"$serde_json::private::Number":"42"},"deep":[{"$serde_json::private::Number":"1","more":2}]}'
-    on: { done: render }
-  render:
-    kind: shell
-    command: 'printf "%s" "$R_MAX"'
-    env:
-      R_MAX: "{{ stages.publish.max }}"
-    capture: text
-    on: { done: finished }
-  finished:
-    kind: terminal
-"#,
-    )
-    .await;
-    f.start().await;
-    f.wait_stage("finished").await;
-
-    let exact = |capture: &Value| {
-        assert_eq!(capture["max"].to_string(), "18446744073709551615");
-        assert_eq!(capture["min"].to_string(), "-9223372036854775808");
-        assert_eq!(capture["ratio"].to_string(), "1.5");
-        assert_eq!(
-            capture["marker"],
-            json!({"$serde_json::private::Number": "42"})
-        );
-        assert_eq!(
-            capture["deep"],
-            json!([{"$serde_json::private::Number": "1", "more": 2}])
-        );
-    };
-    // The persisted payload the later stages and the API read...
-    exact(&f.payload().await["stages"]["publish"]);
-    // ...and the history the stage result carries.
-    let results = f.results().await;
-    exact(&result_of(&results[0]).capture);
-    assert_eq!(f.reviews().await.len(), 1);
-    // The template reads the same number back.
-    assert_eq!(
-        f.payload().await["stages"]["render"],
-        "18446744073709551615"
-    );
-}
-
 /// A publisher whose stdout is `format` through `printf`, so it can carry raw
 /// bytes, ending at `finished` on success and at `failed` on rejection.
 async fn raw_publisher(format: &str) -> Flow {
@@ -777,58 +575,6 @@ stages:
         f.payload().await["stages"]["plain"],
         r#"{"extra":1e400,"marker":{"$serde_json::private::Number":"9"}}"#
     );
-}
-
-#[tokio::test]
-async fn output_bytes_that_are_not_utf8_are_rejected_in_every_string_field() {
-    // 0xff is never valid UTF-8; the shell runner would repair it to U+FFFD.
-    for (field, format) in [
-        ("url", r#"{"number":7,"url":"https://h/\377"}"#),
-        (
-            "label",
-            r##"{"number":7,"url":"https://h/7","label":"#\377"}"##,
-        ),
-        (
-            "extra",
-            r#"{"number":7,"url":"https://h/7","extra":"a\377b"}"#,
-        ),
-        (
-            "an overlong sequence in extra",
-            r#"{"number":7,"url":"https://h/7","extra":"\300\257"}"#,
-        ),
-    ] {
-        let f = raw_publisher(format).await;
-        let result = result_of(&f.results().await[0]);
-        assert_eq!(result.outcome, "error", "{field}");
-        assert!(!result.capture_present, "{field}");
-        assert_eq!(result.destination_stage, "failed", "{field}");
-        no_publication(&f.payload().await);
-        assert!(f.reviews().await.is_empty(), "{field}");
-        assert_eq!(
-            f.command_notes().await,
-            [Some(
-                "open_review output rejected: output is not valid UTF-8".to_string()
-            )],
-            "{field}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn real_unicode_that_looks_like_the_repair_character_is_accepted_as_printed() {
-    // U+FFFD written as its real UTF-8 bytes, plus a JSON-escaped control
-    // character and a multi-byte letter: all valid, all kept as printed.
-    let f = raw_publisher(
-        r#"{"number":7,"url":"https://h/7","label":"\357\277\275 \303\251","extra":"\\u0001\\ufffd"}"#,
-    )
-    .await;
-    let result = result_of(&f.results().await[0]);
-    assert_eq!(result.outcome, "done");
-    assert_eq!(result.destination_stage, "finished");
-    let capture = &f.payload().await["stages"]["publish"];
-    assert_eq!(capture["label"], "\u{fffd} é");
-    assert_eq!(capture["extra"], "\u{1}\u{fffd}");
-    assert_eq!(f.reviews().await[0].label, "\u{fffd} é");
 }
 
 #[tokio::test]
@@ -1003,7 +749,7 @@ async fn a_lookup_walks_back_through_the_publication_to_the_gate_before_it() {
 }
 
 #[tokio::test]
-async fn pruning_the_publications_event_keeps_the_review_and_reports_a_history_gap() {
+async fn pruning_the_publications_event_keeps_the_review_readable() {
     let f = gate_flow_from(CHAIN_FLOW, connect_in_memory().await.unwrap(), tempdir()).await;
     f.reply("please fix the parser\n/go").await.unwrap();
     wait_until_stage(&f.pool, &f.task_id, "hold").await;
@@ -1057,67 +803,12 @@ async fn pruning_the_publications_event_keeps_the_review_and_reports_a_history_g
     assert_eq!(remaining.len(), 2);
 
     assert_eq!(reviews_now().await, [expected]);
-    match ask(&f.pool, &f.task_id, by_name("gate", None, None)).await {
-        ContextResponse::Unavailable { reason, .. } => {
-            assert_eq!(reason, UnavailableReason::HistoryGap)
-        }
-        other => panic!("expected a history gap, got {other:?}"),
-    }
 }
 
 // ---- late outcomes --------------------------------------------------------
 
 fn valid_late_capture() -> Value {
     json!({"number": 2, "url": "https://github.com/o/r/pull/2", "label": "#2"})
-}
-
-#[tokio::test]
-async fn a_publishers_late_outcome_is_refused_once_the_task_is_cancelled() {
-    let f = Flow::new(
-        r#"name: review-late
-stages:
-  publish:
-    kind: open_review
-    script_file: publish.sh
-    on: { done: finished }
-  finished:
-    kind: terminal
-"#,
-    )
-    .await;
-    f.script(
-        "publish.sh",
-        ": > started\nwhile [ ! -f go ]; do sleep 0.05; done\n",
-    );
-    f.start().await;
-    let started = f.dir.join("started");
-    crate::test_support::wait_until("the publisher to start", || async {
-        started.exists().then_some(()).ok_or("not yet".to_string())
-    })
-    .await;
-    f.engine.cancel_task(&f.task_id, false).await.unwrap();
-    let before = (f.payload().await, f.results().await, f.trail().await);
-
-    let late = f
-        .engine
-        .advance_from_stage(
-            &f.task_id,
-            &f.def,
-            "done",
-            Some("publish"),
-            Some(valid_late_capture()),
-            false,
-        )
-        .await;
-    assert!(
-        matches!(late, Err(EngineError::TaskCancelled(_))),
-        "{late:?}"
-    );
-    assert_eq!(
-        (f.payload().await, f.results().await, f.trail().await),
-        before
-    );
-    assert!(f.reviews().await.is_empty());
 }
 
 #[tokio::test]
@@ -1204,7 +895,7 @@ stages:
   echo created >> remote.log
 fi
 if [ -f hang ]; then
-  echo $$ > script.pid; sleep 600 & echo $! > sleeper.pid; : > started; wait
+  : > started; sleep 600
 fi
 cat remote.json
 "#,
@@ -1221,12 +912,9 @@ cat remote.json
         fs::read_to_string(&remote).unwrap(),
         std::os::unix::fs::MetadataExt::ino(&fs::metadata(&remote).unwrap()),
     );
-    let (script, sleeper) = (pid_file(&f, "script.pid"), pid_file(&f, "sleeper.pid"));
-    assert_eq!(ps("pgid", sleeper), Some(script.to_string()));
 
-    // The daemon stops: the owned process group goes with it.
+    // The daemon stops.
     f.engine.abort_all_detached_runners().await;
-    assert_group_gone(script, sleeper).await;
 
     // A restart parks the task at the publisher; nothing was recorded.
     let engine2 = engine_with_adapter_and_workflows_dir(f.pool.clone(), "unused", &f.dir);

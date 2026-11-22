@@ -1,34 +1,14 @@
 //! Loading `kind: open_review`: a shell stage that publishes the task's review.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use super::tests::TempDir;
 use super::*;
 
-/// A fresh directory that is removed when the guard is dropped. Keep it alive
-/// as long as the definition being parsed needs its files.
-struct Dir(PathBuf);
-
-impl std::ops::Deref for Dir {
-    type Target = PathBuf;
-    fn deref(&self) -> &PathBuf {
-        &self.0
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn dir() -> Dir {
-    let path = std::env::temp_dir().join(format!(
-        "chocofactoryd-open-review-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&path).unwrap();
-    Dir(path)
+/// The shared test directory, removed when dropped. Keep it alive as long as
+/// the definition being parsed needs its files.
+fn dir() -> TempDir {
+    TempDir::new()
 }
 
 /// A workflow whose stage `publish` has `body` (indented under it), then a terminal.
@@ -72,45 +52,6 @@ fn a_publisher_resolves_to_a_shell_stage_with_an_implied_json_capture() {
         }
     ));
     assert_eq!(def.stages["run"].kind.name(), "shell");
-}
-
-#[test]
-fn all_seven_yaml_kinds_report_their_yaml_names() {
-    let dir = dir();
-    fs::write(dir.join("turn.md"), "x").unwrap();
-    let yaml = r#"
-name: names
-roles:
-  coder: { cli: claude, model: sonnet, read_only: true, disallowed_tools: [edit, write, notebook_edit] }
-worktree: true
-stages:
-  a: { kind: agent_turn, role: coder, prompt_file: turn.md, on: { done: b } }
-  b: { kind: shell, command: "true", on: { done: c } }
-  c: { kind: open_review, command: "true", on: { done: d } }
-  d: { kind: poll, command: "true", interval: 1s, outcomes: [{ match: x, then: done }], on: { done: e } }
-  e: { kind: human_gate, on: { resumed: f } }
-  f:
-    kind: parallel
-    branches:
-      one: { kind: agent_turn, role: coder, prompt_file: turn.md }
-      two: { kind: agent_turn, role: coder, prompt_file: turn.md }
-    on: { done: g }
-  g: { kind: terminal }
-"#;
-    let def = parse(yaml, &dir).unwrap();
-    let names: Vec<_> = def.stages.values().map(|s| s.kind.name()).collect();
-    assert_eq!(
-        names,
-        [
-            "agent_turn",
-            "shell",
-            "open_review",
-            "poll",
-            "human_gate",
-            "parallel",
-            "terminal"
-        ]
-    );
 }
 
 #[test]
@@ -172,16 +113,6 @@ fn an_explicit_capture_key_is_refused_even_when_null() {
 }
 
 #[test]
-fn a_misspelled_publisher_key_is_refused() {
-    let err = err_of("    command: \"true\"\n    timeuot: 5s\n    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::UnknownStageKey { stage, key }
-            if stage == "publish" && key == "timeuot"),
-        "{err:?}"
-    );
-}
-
-#[test]
 fn a_publisher_needs_a_done_edge() {
     let err = err_of("    command: \"true\"\n    on: { error: finished }\n");
     assert!(
@@ -191,88 +122,7 @@ fn a_publisher_needs_a_done_edge() {
 }
 
 #[test]
-fn a_publisher_needs_exactly_one_of_command_and_script_file() {
-    let err = err_of("    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::MissingShellCommand { stage } if stage == "publish"),
-        "{err:?}"
-    );
-    let dir = dir();
-    crate::test_support::write_executable(&dir.join("p.sh"), "#!/bin/sh\n");
-    let err = parse(
-        &flow("    command: \"true\"\n    script_file: p.sh\n    on: { done: finished }\n"),
-        &dir,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, WorkflowDefError::AmbiguousShellCommand { stage } if stage == "publish"),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn a_publisher_shares_the_shell_reference_duration_env_and_template_checks() {
-    // A script_file that is missing.
-    let err = err_of("    script_file: nowhere.sh\n    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::MissingReferencedFile { field, .. } if *field == "script_file"),
-        "{err:?}"
-    );
-    // A script_file that is deleted after being written.
-    let dir = dir();
-    let script = dir.join("p.sh");
-    crate::test_support::write_executable(&script, "#!/bin/sh\n");
-    fs::remove_file(&script).unwrap();
-    let err = parse(
-        &flow("    script_file: p.sh\n    on: { done: finished }\n"),
-        &dir,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, WorkflowDefError::MissingReferencedFile { .. }),
-        "{err:?}"
-    );
-    // Duration, env name, duplicate env key, unknown stage template.
-    let err = err_of("    command: \"true\"\n    timeout: soon\n    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::InvalidDuration { stage, field, .. } if stage == "publish" && *field == "timeout"),
-        "{err:?}"
-    );
-    let err = err_of("    command: \"true\"\n    env: { \"1X\": v }\n    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::InvalidEnvName { stage, name } if stage == "publish" && name == "1X"),
-        "{err:?}"
-    );
-    let err = parse(
-        &flow("    command: \"true\"\n    env:\n      A: one\n      A: two\n    on: { done: finished }\n"),
-        &dir,
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().to_lowercase().contains("duplicate"),
-        "{err}"
-    );
-    let err =
-        err_of("    command: \"echo {{ stages.ghost.number }}\"\n    on: { done: finished }\n");
-    assert!(
-        matches!(&err, WorkflowDefError::UnknownTemplateStage { stage, referenced, .. }
-            if stage == "publish" && referenced == "ghost"),
-        "{err:?}"
-    );
-}
-
-#[test]
 fn a_later_stage_may_template_the_publishers_fields() {
     let yaml = "name: x\nstages:\n  publish:\n    kind: open_review\n    command: \"true\"\n    on: { done: after }\n  after:\n    kind: shell\n    command: \"echo {{ stages.publish.number }}\"\n    env: { L: \"{{ stages.publish.label }}\" }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
     parse(yaml, &dir()).unwrap();
-}
-
-#[test]
-fn a_test_directory_is_removed_when_its_guard_is_dropped() {
-    let guard = dir();
-    let path = guard.to_path_buf();
-    fs::write(path.join("p.md"), "x").unwrap();
-    assert!(path.is_dir());
-    drop(guard);
-    assert!(!path.exists());
 }

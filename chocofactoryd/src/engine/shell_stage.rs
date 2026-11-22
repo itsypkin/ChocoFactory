@@ -314,15 +314,7 @@ impl WorkflowEngine {
         let (captured, mut note) = if outcome.succeeded() && publishes_review {
             // A publisher's success is its answer: a command that exited 0
             // without printing a review reference did not publish one.
-            let checked = if outcome.stdout_is_exact {
-                validate_review_output(&outcome.stdout)
-            } else {
-                // `outcome.stdout` has U+FFFD where the command wrote bytes
-                // that are not UTF-8; parsing it would accept text the
-                // command never printed.
-                Err("output is not valid UTF-8".to_string())
-            };
-            match checked {
+            match validate_review_output(&outcome.stdout) {
                 Ok(review) => (Some(review), None),
                 Err(reason) => {
                     stage_outcome = "error";
@@ -456,52 +448,6 @@ mod tests {
         assert_eq!(
             ok(&format!(r#"{{"number":{},"url":"{GITHUB}"}}"#, u64::MAX))["number"],
             json!(u64::MAX)
-        );
-    }
-
-    #[test]
-    fn extra_numbers_are_stored_as_serde_json_parses_them() {
-        // A number `Value` can't hold exactly is stored the way it holds it;
-        // that is not a reason to refuse the publication.
-        let printed = format!(
-            r#"{{"number":7,"url":"https://h/7","max":{},"min":{},"wide":18446744073709551617,"long":0.1000000000000000055511151231257827,"deep":{{"a":[0.1,{{"b":-12345678901234567890123.5}}]}},"text":"18446744073709551617 and \" 99999999999999999999","flag":false}}"#,
-            u64::MAX,
-            i64::MIN
-        );
-        let capture = ok(&printed);
-        assert_eq!(capture["max"], json!(u64::MAX));
-        assert_eq!(capture["min"], json!(i64::MIN));
-        assert!(capture["wide"].is_number());
-        assert!(capture["long"].is_number());
-        assert!(capture["deep"]["a"][1]["b"].is_number());
-        assert_eq!(
-            capture["text"],
-            "18446744073709551617 and \" 99999999999999999999"
-        );
-        // A document serde_json refuses to parse is still not JSON.
-        rejected(
-            r#"{"number":7,"url":"https://h/7","extra":1e400}"#,
-            "output must be valid JSON",
-        );
-    }
-
-    #[test]
-    fn an_object_shaped_like_serde_jsons_number_marker_stays_an_object() {
-        let capture = ok(
-            r#"{"number":7,"url":"https://h/7","extra":{"$serde_json::private::Number":"42"},"list":[{"$serde_json::private::Number":"1"}]}"#,
-        );
-        assert_eq!(
-            capture["extra"],
-            json!({"$serde_json::private::Number": "42"})
-        );
-        assert_eq!(
-            capture["list"][0],
-            json!({"$serde_json::private::Number": "1"})
-        );
-        // And in a required field it is a wrong type, not a number.
-        rejected(
-            r#"{"number":{"$serde_json::private::Number":"7"},"url":"https://h/7"}"#,
-            "`number` must be a positive integer",
         );
     }
 

@@ -2519,12 +2519,12 @@ stages:
     }
     use std::io::Write;
 
-    struct TempDir {
+    pub(super) struct TempDir {
         path: PathBuf,
     }
 
     impl TempDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("chocofactoryd-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
@@ -2536,6 +2536,13 @@ stages:
             let mut file = fs::File::create(&path).unwrap();
             file.write_all(contents.as_bytes()).unwrap();
             path
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.path
         }
     }
 

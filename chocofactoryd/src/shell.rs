@@ -52,12 +52,6 @@ pub struct ShellOutcome {
     /// about to follow an `error` edge and retry on top of whatever
     /// survived. Only ever set alongside `timed_out`.
     pub escaped: bool,
-    /// Whether `stdout` is exactly what the command wrote. `false` means the
-    /// bytes were not valid UTF-8 and `stdout` has U+FFFD in their place, so a
-    /// consumer that needs the real bytes (an `open_review` publisher) must not
-    /// trust it. Not checked for a timed-out command, whose output nothing
-    /// reads as an answer; it is `true` there.
-    pub stdout_is_exact: bool,
 }
 
 impl ShellOutcome {
@@ -386,7 +380,6 @@ pub async fn run(
                     duration: started.elapsed(),
                     timed_out: true,
                     escaped,
-                    stdout_is_exact: true,
                 });
             }
         },
@@ -407,7 +400,6 @@ pub async fn run(
         duration: started.elapsed(),
         timed_out: false,
         escaped: false,
-        stdout_is_exact: std::str::from_utf8(&output.stdout).is_ok(),
     })
 }
 
@@ -824,23 +816,6 @@ mod tests {
 
         assert!(outcome.succeeded());
         assert!(!outcome.stdout.is_empty());
-        assert!(!outcome.stdout_is_exact);
-    }
-
-    #[tokio::test]
-    async fn valid_utf8_output_is_exact_even_when_it_contains_the_repair_character() {
-        // U+FFFD spelled as its own UTF-8 bytes is what the command wrote.
-        let outcome = run(
-            &inline("printf '\\357\\277\\275'"),
-            &std::env::temp_dir(),
-            None,
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(outcome.stdout, "\u{fffd}");
-        assert!(outcome.stdout_is_exact);
     }
 
     #[tokio::test]

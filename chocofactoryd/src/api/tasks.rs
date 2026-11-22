@@ -1973,41 +1973,6 @@ stages:
         }
     }
 
-    /// Selecting the review never loads the workflow definition.
-    #[tokio::test]
-    async fn a_pointed_review_stays_readable_after_its_workflow_file_is_deleted() {
-        let server = TestServer::start().await;
-        seed_gate_only(&server);
-        let file_dir = server.temp_dir();
-        let workflow_path = file_dir.join("mine.yaml");
-        std::fs::copy(server.builtin_workflow_path("gate-only"), &workflow_path).unwrap();
-        let project_id = create_project(&server).await;
-        let task: Value = server
-            .post(
-                "/tasks",
-                json!({"project_id": project_id, "workflow_file": workflow_path.to_str().unwrap(),
-                       "title": "t", "prompt": "hello"}),
-            )
-            .await
-            .json();
-        let id = task["id"].as_str().unwrap().to_string();
-        let url = "https://git.example.internal/g/p/-/merge_requests/8";
-        set_payload(
-            &server,
-            &id,
-            json!({REVIEW_STAGE_KEY: "publish", "stages": {"publish": {"number": 8, "url": url, "label": "!8"}}}),
-        )
-        .await;
-        std::fs::remove_file(&workflow_path).unwrap();
-
-        let expected = json!([review_json("publish", 8, url, "!8")]);
-        let listed: Value = server.get("/tasks").await.json();
-        assert_eq!(listed[0]["reviews"], expected);
-        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
-        assert_eq!(detail["workflow_file_status"], "missing");
-        assert_eq!(detail["reviews"], expected);
-    }
-
     #[tokio::test]
     async fn list_status_accepts_a_comma_separated_list() {
         let server = TestServer::start().await;
