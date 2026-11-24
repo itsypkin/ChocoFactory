@@ -2241,9 +2241,13 @@ fn the_supplied_label_and_url_reach_the_list_search_and_detail() {
     unpublished.reviews = vec![];
     deliver(&mut app, g, vec![row.clone(), unpublished]);
     let s = render(&app, 120, 30);
-    let bare = s.lines().find(|l| l.contains("0ther000")).expect(&s);
-    let cell = bare.trim_end_matches([' ', '│']);
-    assert!(cell.ends_with("  -"), "{s}");
+    let bare = s
+        .lines()
+        .find(|l| l.contains("Nothing published"))
+        .expect(&s);
+    // Between the popup's borders: the board shows around it.
+    let inside = bare.split('│').nth(1).expect(&s);
+    assert!(inside.trim_end().ends_with("  -"), "{s}");
     typed(&mut app, "!42");
     let s = render(&app, 120, 30);
     assert!(s.contains("1 of 2 tasks"), "{s}");
