@@ -416,9 +416,10 @@ pub enum TaskCmd {
         /// `closed`, `cancelled`, or `stuck`.
         #[arg(long)]
         status: Option<String>,
-        /// Keep only tasks matching TEXT: `#289` is PR 289 exactly; digits
-        /// match that PR or an id prefix; other text matches a title
-        /// substring or id prefix (any case). Combines with --project/--status.
+        /// Keep only tasks matching TEXT: `#289` or `!289` is review number
+        /// 289 exactly; digits match that review number or an id prefix; other
+        /// text matches a title substring or id prefix (any case). Combines
+        /// with --project/--status.
         #[arg(long, value_name = "TEXT", value_parser = parse_search_text)]
         search: Option<String>,
     },

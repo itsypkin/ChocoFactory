@@ -79,7 +79,7 @@ fn waiting(mut t: TaskSummary) -> TaskSummary {
     t
 }
 
-fn with_pr(mut t: TaskSummary, n: u64) -> TaskSummary {
+fn with_review(mut t: TaskSummary, n: u64) -> TaskSummary {
     t.reviews = vec![ReviewRef {
         stage: "open_pr".into(),
         number: n,
@@ -87,6 +87,29 @@ fn with_pr(mut t: TaskSummary, n: u64) -> TaskSummary {
         label: format!("#{n}"),
     }];
     t
+}
+
+const MERGE_URL: &str = "https://review.example/team/repo/-/merge_requests/42";
+const STALE_URL: &str = "https://stale.example/team/repo/pull/99";
+
+/// A publisher's own label and URL, from a stage not named `open_pr`.
+fn supplied_review() -> ReviewRef {
+    ReviewRef {
+        stage: "publish_change".into(),
+        number: 42,
+        url: MERGE_URL.into(),
+        label: "!42".into(),
+    }
+}
+
+/// A competing reference that must lose wherever the supplied one applies.
+fn stale_review() -> ReviewRef {
+    ReviewRef {
+        stage: "open_pr".into(),
+        number: 99,
+        url: STALE_URL.into(),
+        label: "#99".into(),
+    }
 }
 
 fn stuck(mut t: TaskSummary, reason: &str, updated_mins_ago: i64) -> TaskSummary {
@@ -157,7 +180,7 @@ fn board() -> App {
     let mut app = new_app(Scope::AllProjects);
     app.projects.insert("p-alpha".into(), "chocofactory".into());
     app.projects.insert("p-beta".into(), "webshop".into());
-    let mut review = with_pr(
+    let mut review = with_review(
         waiting(summary(
             "3f2a91c0-aaaa",
             "Interactive terminal dashboard (#164)",
@@ -198,7 +221,7 @@ fn board() -> App {
         "interrupted by a usage limit\nsecond line",
         41,
     );
-    let mut done = with_pr(
+    let mut done = with_review(
         summary(
             "61b0f2e3-eeee",
             "Release 0.2.2",
@@ -488,24 +511,29 @@ fn a_failed_action_shows_the_daemons_error_and_does_not_refresh() {
 }
 
 #[test]
-fn open_pr_without_a_pr_over_ssh_and_normally() {
+fn o_over_ssh_and_normally_with_and_without_a_review() {
     let mut app = board();
-    ch(&mut app, 'j'); // b81e…, no PR
-    assert!(ch(&mut app, 'o').is_empty());
-    assert_eq!(app.status.as_ref().unwrap().text, "no PR yet");
+    ch(&mut app, 'j'); // b81e…, no review
+    for ssh in [false, true] {
+        app.ssh = ssh;
+        app.status = None;
+        assert!(ch(&mut app, 'o').is_empty(), "ssh={ssh}");
+        assert_eq!(app.status.as_ref().unwrap().text, "no review yet");
+    }
 
-    ch(&mut app, 'k'); // 3f2a… has PR #171
-    app.ssh = true;
+    ch(&mut app, 'k'); // 3f2a…
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == "3f2a91c0-aaaa")
+        .unwrap()
+        .reviews = vec![supplied_review()];
     assert!(ch(&mut app, 'o').is_empty());
-    assert_eq!(
-        app.status.as_ref().unwrap().text,
-        "PR #171: https://github.com/o/r/pull/171"
-    );
+    let said = format!("Review !42: {MERGE_URL}");
+    assert_eq!(app.status.as_ref().unwrap().text, said);
+    let s = render(&app, 120, 30);
+    assert!(s.contains(&said), "{s}");
     app.ssh = false;
-    assert_eq!(
-        ch(&mut app, 'o'),
-        vec![Effect::OpenUrl("https://github.com/o/r/pull/171".into())]
-    );
+    assert_eq!(ch(&mut app, 'o'), vec![Effect::OpenUrl(MERGE_URL.into())]);
 }
 
 #[test]
@@ -2031,7 +2059,7 @@ fn the_status_view_shows_fields_progress_counters_and_the_event_tail() {
         String::new(),
         String::new(),
         String::new(),
-        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
+        "e events  o review  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 30), &expected);
@@ -2057,67 +2085,391 @@ fn the_dashboard_status_view_leaves_out_the_closes_row() {
     );
 }
 
-fn with_detail_status(mut v: Value, status: &str, stage: &str) -> Value {
+fn with_detail_status(
+    mut v: Value,
+    id: &str,
+    status: &str,
+    stage: &str,
+    stage_kind: &str,
+) -> Value {
+    v["id"] = json!(id);
     v["status"] = json!(status);
     v["workflow_state"]["current_stage"] = json!(stage);
+    v["workflow_state"]["stage_kind"] = json!(stage_kind);
     v
 }
 
+/// A task id as the daemon makes them, at full length.
+const GATE_ID: &str = "3f2a91c0-7c1d-4a52-9b0e-5d2f6a1c8e47";
+
+/// The command every gate hint carries, for [`GATE_ID`].
+fn send_command() -> String {
+    format!("choco task send {GATE_ID} --text \"…\"")
+}
+
+fn marked_hint() -> String {
+    format!(
+        "a marker on its own line (choco: changes or choco: accept): {}",
+        send_command()
+    )
+}
+
+fn unavailable_hint() -> String {
+    format!(
+        "marker instructions unavailable, so a reply may be refused. Reply with {}",
+        send_command()
+    )
+}
+
+/// The `GET /tasks/{id}` answer for an open task at a customer-named gate,
+/// with a published review and an unrelated capture that has its own link.
+fn gate_detail(gate_markers: Value) -> Value {
+    let mut v = with_detail_status(
+        busy_detail(),
+        GATE_ID,
+        "open",
+        "accept_change",
+        "human_gate",
+    );
+    v["gate_markers"] = gate_markers;
+    v["reviews"] = json!([supplied_review()]);
+    v["workflow_state"]["payload"] =
+        json!({"stages": {"open_pr": {"number": 99, "url": STALE_URL}}});
+    v
+}
+
+fn gate_summary(status: &str, stage: &str) -> TaskSummary {
+    summary(
+        GATE_ID,
+        "Ship it",
+        status,
+        Some(stage),
+        Some(125),
+        "p-alpha",
+    )
+}
+
+/// A detail view of [`GATE_ID`] that has a snapshot only.
+fn gate_view(snapshot: TaskSummary) -> App {
+    let mut app = new_app(Scope::AllProjects);
+    load(&mut app, vec![snapshot], vec![]);
+    open_detail(&mut app, GATE_ID);
+    app
+}
+
+fn drop_snapshot(app: &mut App) {
+    load(app, vec![], vec![]);
+    let View::Detail(d) = &mut app.view else {
+        panic!("not in the detail view")
+    };
+    d.snapshot = None;
+}
+
+/// A detail view that has only the loaded answer: no list row, no snapshot.
+fn detail_only(detail: Value) -> App {
+    let mut app = gate_view(gate_summary("open", "accept_change"));
+    drop_snapshot(&mut app);
+    answer(&mut app, GATE_ID, Ok(detail));
+    app
+}
+
+/// The `Waiting for` row with its wrapped lines joined again.
+fn waiting_row(screen: &str) -> Option<String> {
+    let mut lines = screen.lines().map(str::trim_end);
+    let first = lines
+        .by_ref()
+        .find_map(|l| l.strip_prefix("Waiting for  "))?;
+    let mut parts = vec![first];
+    parts.extend(
+        lines
+            .take_while(|l| l.starts_with("             "))
+            .map(str::trim_start),
+    );
+    Some(parts.join(" "))
+}
+
 #[test]
-fn a_task_waiting_on_you_shows_the_pr_and_what_it_waits_for() {
-    let mut app = board();
-    let id = "3f2a91c0-aaaa";
-    open_detail(&mut app, id);
+fn a_task_waiting_on_you_shows_the_review_and_how_to_reply() {
+    let mut snapshot = waiting(gate_summary("open", "accept_change"));
+    snapshot.reviews = vec![supplied_review()];
+    let mut app = gate_view(snapshot);
+    // Until the answer arrives there are no markers to show.
+    let s = render(&app, 160, 30);
+    assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{s}");
+
     answer(
         &mut app,
-        id,
-        Ok(with_detail_status(
-            busy_detail(),
-            "open",
-            "awaiting_human_review",
-        )),
+        GATE_ID,
+        Ok(gate_detail(json!(["choco: changes", "choco: accept"]))),
     );
-    let s = render(&app, 100, 30);
-    let want_stage = "Stage        awaiting_human_review for 2h05m";
-    let want_pr = "PR           #171 https://github.com/o/r/pull/171";
-    let want_wait =
-        "Waiting for  your verdict: a PR comment with /approve or /request-changes on its own line";
+    let s = render(&app, 160, 30);
+    let want_stage = "Stage        accept_change for 2h05m";
+    let want_review = format!("Review       !42 {MERGE_URL}");
+    let want_wait = format!("Waiting for  {}", marked_hint());
     let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
     let i = lines.iter().position(|l| *l == want_stage).expect(&s);
-    assert_eq!(lines[i + 1], want_pr, "{s}");
+    assert_eq!(lines[i + 1], want_review, "{s}");
     assert_eq!(lines[i + 2], want_wait, "{s}");
+    assert!(!s.contains("/approve"), "{s}");
+}
 
-    {
-        let (id, stage) = ("b81e0d44-cccc", "escalate_to_human");
-        let want = "Waiting for  a note to resume it: choco task send b81e0d44-cccc --text \"…\"";
-        let mut app = board();
-        open_detail(&mut app, id);
-        answer(
-            &mut app,
-            id,
-            Ok(with_detail_status(busy_detail(), "open", stage)),
+#[test]
+fn the_supplied_label_and_url_reach_the_list_search_and_detail() {
+    let mut row = gate_summary("open", "accept_change");
+    row.reviews = vec![supplied_review()];
+    let mut app = new_app(Scope::AllProjects);
+    load(&mut app, vec![row.clone()], vec![]);
+    let check = |surface: &str, s: &str| {
+        assert!(s.contains("!42"), "{surface}: no supplied label\n{s}");
+        for wrong in ["#42", "#99", STALE_URL] {
+            assert!(!s.contains(wrong), "{surface}: shows {wrong}\n{s}");
+        }
+    };
+    let s = render(&app, 120, 30);
+    check("list", &s);
+    assert!(s.contains("Review"), "{s}");
+
+    let g = open_search(&mut app);
+    deliver(&mut app, g, vec![row.clone()]);
+    typed(&mut app, "!42");
+    let s = render(&app, 120, 30);
+    assert!(s.contains("1 of 1 tasks"), "{s}");
+    // The query line repeats `!42`: look at the result row alone.
+    let result = s.lines().find(|l| l.contains('▶') && l.contains('│'));
+    check("search", result.expect(&s));
+
+    let app = detail_only(gate_detail(Value::Null));
+    let s = render(&app, 120, 30);
+    check("detail", &s);
+    assert!(s.contains(MERGE_URL), "{s}");
+}
+
+#[test]
+fn o_takes_the_loaded_details_review_over_a_stale_list_or_snapshot() {
+    let stale_row = || {
+        let mut t = gate_summary("open", "accept_change");
+        t.reviews = vec![stale_review()];
+        t
+    };
+    let opened = |app: &mut App| ch(app, 'o');
+    let open_url = |url: &str| vec![Effect::OpenUrl(url.into())];
+
+    // Detail only. Another task, with its own review, is selected behind it.
+    let mut app = detail_only(gate_detail(Value::Null));
+    let mut other = with_review(gate_summary("open", "accept_change"), 7);
+    other.task.id = "0ther000-aaaa".into();
+    load(&mut app, vec![other], vec![]);
+    app.selected = Some("0ther000-aaaa".into());
+    assert_eq!(opened(&mut app), open_url(MERGE_URL));
+
+    // Before the answer, the snapshot; after it, the answer, over a list row
+    // and a snapshot that both still carry the old link.
+    let mut app = gate_view(stale_row());
+    assert_eq!(opened(&mut app), open_url(STALE_URL));
+    answer(&mut app, GATE_ID, Ok(gate_detail(Value::Null)));
+    assert_eq!(opened(&mut app), open_url(MERGE_URL));
+
+    // A loaded answer with no usable review stays that way.
+    let one_with = |reviews: Value| {
+        let mut v = gate_detail(Value::Null);
+        v["reviews"] = reviews;
+        v
+    };
+    let mut missing = gate_detail(Value::Null);
+    missing.as_object_mut().unwrap().remove("reviews");
+    for detail in [
+        one_with(json!([])),
+        one_with(Value::Null),
+        one_with(json!(STALE_URL)),
+        one_with(json!([{"stage": "p", "number": "42", "url": MERGE_URL, "label": "!42"}])),
+        missing,
+    ] {
+        let mut app = gate_view(stale_row());
+        answer(&mut app, GATE_ID, Ok(detail.clone()));
+        for ssh in [false, true] {
+            app.ssh = ssh;
+            app.status = None;
+            assert_eq!(opened(&mut app), vec![], "ssh={ssh} {detail}");
+            assert_eq!(app.status.as_ref().unwrap().text, "no review yet");
+        }
+        assert!(
+            crate::render::task_fields(&detail)
+                .iter()
+                .all(|(l, _)| *l != "Review")
         );
         let s = render(&app, 120, 30);
-        assert!(s.lines().any(|l| l.trim_end() == want), "{s}");
+        assert!(!s.lines().any(|l| l.starts_with("Review ")), "{s}");
+        assert!(!s.contains(STALE_URL), "{s}");
+    }
+}
+
+#[test]
+fn the_detail_shows_exactly_one_review_row() {
+    let snapshot = || {
+        let mut t = gate_summary("open", "accept_change");
+        t.reviews = vec![supplied_review()];
+        t
+    };
+    let mut both = gate_view(snapshot());
+    answer(&mut both, GATE_ID, Ok(gate_detail(Value::Null)));
+    // No workflow state in the answer: Stage comes from the snapshot alone.
+    let mut stateless = gate_view(snapshot());
+    let mut detail = gate_detail(Value::Null);
+    detail["workflow_state"] = Value::Null;
+    answer(&mut stateless, GATE_ID, Ok(detail));
+    for (name, app) in [
+        ("detail only", detail_only(gate_detail(Value::Null))),
+        ("detail and snapshot", both),
+        ("snapshot only", gate_view(snapshot())),
+        ("no workflow state", stateless),
+    ] {
+        let s = render(&app, 120, 40);
+        assert_eq!(s.matches(MERGE_URL).count(), 1, "{name}: URL\n{s}");
+        let rows: Vec<&str> = s
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| l.starts_with("Review ") || l.starts_with("PR "))
+            .collect();
+        assert_eq!(rows.len(), 1, "{name}\n{s}");
+        assert!(
+            rows[0].starts_with("Review ") && rows[0].ends_with(&format!(" !42 {MERGE_URL}")),
+            "{name}\n{s}"
+        );
+        let at = |label: &str| s.lines().position(|l| l.starts_with(label));
+        assert_eq!(at("Review ").map(|i| i - 1), at("Stage "), "{name}\n{s}");
+    }
+}
+
+#[test]
+fn a_gate_without_markers_offers_a_note_and_unreadable_markers_say_so() {
+    let app = detail_only(gate_detail(json!([])));
+    let s = render(&app, 120, 30);
+    assert_eq!(
+        waiting_row(&s),
+        Some(format!("a note: {}", send_command())),
+        "{s}"
+    );
+
+    let mut missing = gate_detail(Value::Null);
+    missing.as_object_mut().unwrap().remove("gate_markers");
+    for detail in [
+        gate_detail(Value::Null),
+        missing,
+        gate_detail(json!("choco: accept")),
+        gate_detail(json!({"line": "choco: accept"})),
+        gate_detail(json!(["choco: accept", 7])),
+    ] {
+        let app = detail_only(detail.clone());
+        let s = render(&app, 120, 30);
+        assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{detail}\n{s}");
+        assert!(
+            !s.contains("/approve") && !s.contains("choco: accept"),
+            "{s}"
+        );
     }
 
-    // `spec_questions` needs a task at that stage.
-    let mut app = new_app(Scope::AllProjects);
-    let t = waiting(summary(
-        "5e5e5e5e-ffff",
-        "Spec it",
-        "open",
-        Some("spec_questions"),
-        Some(5),
-        "p-alpha",
-    ));
-    load(&mut app, vec![t], vec![]);
-    open_detail(&mut app, "5e5e5e5e-ffff");
+    // The answer failed: the snapshot still says it waits.
+    let mut app = gate_view(waiting(gate_summary("open", "accept_change")));
+    answer(&mut app, GATE_ID, Err("connection refused".into()));
     let s = render(&app, 120, 30);
-    let want = "Waiting for  your answers to the spec check's questions: choco task send 5e5e5e5e-ffff --text \"…\"";
-    assert!(s.lines().any(|l| l.trim_end() == want), "{s}");
-    // No PR yet: no PR row.
-    assert!(!s.lines().any(|l| l.starts_with("PR ")), "{s}");
+    assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{s}");
+}
+
+#[test]
+fn only_an_open_gate_gets_a_waiting_row() {
+    let markers = || json!(["choco: changes", "choco: accept"]);
+    let detail = |status: Value, kind: Value| {
+        let mut v = gate_detail(markers());
+        v["status"] = status;
+        v["workflow_state"]["stage_kind"] = kind;
+        v
+    };
+    // With no snapshot: the answer's own status and stage kind.
+    let app = detail_only(detail(json!("open"), json!("human_gate")));
+    let s = render(&app, 160, 30);
+    assert_eq!(waiting_row(&s), Some(marked_hint()), "{s}");
+    let inactive = [
+        json!("paused"),
+        json!("pausing"),
+        json!("stuck"),
+        json!("closed"),
+        json!("cancelled"),
+        json!("reopened"),
+        Value::Null,
+        json!(1),
+    ]
+    .map(|status| (status, json!("human_gate")));
+    let not_gates = [
+        json!("agent_turn"),
+        json!("shell"),
+        json!("open_review"),
+        json!("poll"),
+        json!("terminal"),
+        json!("parallel"),
+        json!("gate"),
+        Value::Null,
+        json!(1),
+    ]
+    .map(|kind| (json!("open"), kind));
+    for (status, kind) in inactive.into_iter().chain(not_gates) {
+        let app = detail_only(detail(status.clone(), kind.clone()));
+        let s = render(&app, 160, 30);
+        assert_eq!(waiting_row(&s), None, "status={status} kind={kind}\n{s}");
+    }
+
+    // With a snapshot: its status and `waiting_on_human` win over an answer
+    // that still says open at a gate. The daemon reports neither a waiting
+    // task that isn't open nor, here, an open one away from a gate.
+    let snapshots = ["paused", "pausing", "stuck", "closed", "cancelled"]
+        .map(|status| gate_summary(status, "accept_change"))
+        .into_iter()
+        .chain([gate_summary("open", "accept_change")]);
+    for snapshot in snapshots {
+        let status = snapshot.task.status.clone();
+        let mut app = new_app(Scope::AllProjects);
+        let closed = matches!(status.as_str(), "closed" | "cancelled");
+        let (active, closed) = if closed {
+            (vec![], vec![snapshot])
+        } else {
+            (vec![snapshot], vec![])
+        };
+        load(&mut app, active, closed);
+        open_detail(&mut app, GATE_ID);
+        answer(
+            &mut app,
+            GATE_ID,
+            Ok(detail(json!("open"), json!("human_gate"))),
+        );
+        let s = render(&app, 160, 30);
+        assert_eq!(waiting_row(&s), None, "snapshot {status}\n{s}");
+    }
+}
+
+#[test]
+fn a_snapshot_at_another_stage_withholds_the_old_gates_markers() {
+    let old = || gate_detail(json!(["choco: old-verdict"]));
+    let mut app = gate_view(waiting(gate_summary("open", "second_gate")));
+    answer(&mut app, GATE_ID, Ok(old()));
+    let s = render(&app, 160, 30);
+    assert!(!s.contains("choco: old-verdict"), "old markers shown\n{s}");
+    assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{s}");
+
+    // The matching answer arrives.
+    let mut next = gate_detail(json!(["choco: changes", "choco: accept"]));
+    next["workflow_state"]["current_stage"] = json!("second_gate");
+    answer(&mut app, GATE_ID, Ok(next));
+    let s = render(&app, 160, 30);
+    assert_eq!(waiting_row(&s), Some(marked_hint()), "{s}");
+
+    // Two missing stages are not the same stage.
+    let mut snapshot = waiting(gate_summary("open", "second_gate"));
+    snapshot.current_stage = None;
+    let mut app = gate_view(snapshot);
+    let mut detail = old();
+    detail["workflow_state"] = Value::Null;
+    answer(&mut app, GATE_ID, Ok(detail));
+    let s = render(&app, 160, 30);
+    assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{s}");
 }
 
 #[test]
@@ -2206,7 +2558,14 @@ fn a_closed_task_says_how_long_ago_it_closed() {
     answer(
         &mut app,
         id,
-        Ok(with_detail_status(busy_detail(), "closed", "done")),
+        Ok({
+            let mut v = with_detail_status(busy_detail(), id, "closed", "done", "terminal");
+            v["reviews"] = json!([{
+                "stage": "open_pr", "number": 163,
+                "url": "https://github.com/o/r/pull/163", "label": "#163"
+            }]);
+            v
+        }),
     );
     push_events(&mut app, id, 2);
     let s = render(&app, 100, 30);
@@ -2217,7 +2576,7 @@ fn a_closed_task_says_how_long_ago_it_closed() {
         .expect(&s);
     assert_eq!(
         lines[i + 1],
-        "PR        #163 https://github.com/o/r/pull/163",
+        "Review    #163 https://github.com/o/r/pull/163",
         "{s}"
     );
     assert!(
@@ -2243,7 +2602,7 @@ fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
     }
     expected.extend(std::iter::repeat_n(String::new(), 20));
     expected.push(
-        "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel"
+        "PgUp/PgDn scroll  End follow  e/Esc status  o review  r retry  p pause  s send  c cancel"
             .into(),
     );
     assert_screen(&render(&app, 100, 30), &expected.join("\n"));
@@ -2374,7 +2733,7 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
         "  … 3 earlier steps".into(),
         "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
         "Loop counters  internal_review=2".into(),
-        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
+        "e events  o review  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 12), &expected);
@@ -2806,7 +3165,7 @@ fn the_cost_column_shows_only_from_width_91_and_leaves_the_other_columns() {
         assert!(!s.contains("cost") && !s.contains("≈$"), "{w}\n{s}");
         // Everything present at 80 before the cost column existed.
         for want in [
-            "id", "project", "title", "stage", "PR", "laps", "#171", "×2", "2h05m",
+            "id", "project", "title", "stage", "Review", "laps", "#171", "×2", "2h05m",
         ] {
             assert!(s.contains(want), "{w}: missing {want:?}\n{s}");
         }
@@ -2846,6 +3205,15 @@ fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() 
     ] {
         give_usage(&mut app, id, 1.234, "api_equivalent");
     }
+    for (id, label) in [("3f2a91c0-aaaa", "!42"), ("9c03aa17-bbbb", LONG_LABEL)] {
+        let mut review = supplied_review();
+        review.label = label.into();
+        app.active
+            .iter_mut()
+            .find(|t| t.task.id == id)
+            .unwrap()
+            .reviews = vec![review];
+    }
     let title_chars = |app: &App, w: u16| -> usize {
         let s = render(app, w, 30);
         let line = s
@@ -2856,10 +3224,18 @@ fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() 
     };
     let at_80 = title_chars(&app, 80);
     for w in 40..=140u16 {
-        let s = render(&app, w, 30);
-        for line in s.lines() {
-            assert!(line.trim_end().chars().count() <= w as usize, "{w}\n{s}");
+        for h in 10..=40u16 {
+            for line in render(&app, w, h).lines() {
+                assert!(line.trim_end().chars().count() <= w as usize, "{w}x{h}");
+            }
         }
+        let s = render(&app, w, 30);
+        // The heading fits its column; a label that doesn't is clipped as
+        // supplied, never rebuilt from the number.
+        for want in ["Review", "!42", "group…"] {
+            assert_eq!(s.contains(want), w >= 80, "{w}: {want}\n{s}");
+        }
+        assert!(!s.contains("#42") && !s.contains("#1234567"), "{w}\n{s}");
         assert_eq!(s.contains("cost"), w >= 91, "{w}\n{s}");
         assert_eq!(s.contains("≈$1.23"), w >= 91, "{w}\n{s}");
         for want in [
@@ -3117,7 +3493,7 @@ fn the_80x24_status_view_shows_the_aligned_table() {
         format!("  {}  human_message message 4", at(4)),
         format!("  {}  human_message message 5", at(5)),
         format!("  {}  human_message message 6", at(6)),
-        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
+        "e events  o review  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 80, 24), &expected);
@@ -3394,6 +3770,48 @@ fn the_detail_view_keeps_its_invariants_at_every_size() {
             }
         }
     }
+    // The same with a review row and a gate hint: each kind of hint, both
+    // kinds of label, with and without a snapshot.
+    let note = format!("a note: {}", send_command());
+    let marked = json!(["choco: changes", "choco: accept"]);
+    for (markers, hint, label, snapshot) in [
+        (marked, marked_hint(), "!42", true),
+        (json!([]), note, LONG_LABEL, false),
+        (Value::Null, unavailable_hint(), "!42", false),
+    ] {
+        let app = long_gate_view(markers, label, snapshot);
+        for w in 40..=140u16 {
+            for h in 10..=40u16 {
+                assert_detail_invariants(&app, w, h, false);
+            }
+            let s = render(&app, w, 40);
+            // The row is the supplied label and URL, clipped at the edge.
+            let review = format!("Review       {label} {MERGE_URL}");
+            let line = s.lines().find(|l| l.starts_with("Review ")).expect(&s);
+            let line = line.trim_end().trim_end_matches('…');
+            assert!(review.starts_with(line) && line.contains(label), "{w}\n{s}");
+            if w >= 100 {
+                assert_eq!(waiting_row(&s).as_ref(), Some(&hint), "{w}\n{s}");
+            }
+        }
+    }
+}
+
+const LONG_LABEL: &str = "group/proj!1234567";
+
+/// [`long_detail`] at an open gate with a published review.
+fn long_gate_view(gate_markers: Value, label: &str, snapshot: bool) -> App {
+    let mut d = with_detail_status(long_detail(34, false), GATE_ID, "open", "ci", "human_gate");
+    d["gate_markers"] = gate_markers;
+    let mut review = supplied_review();
+    review.label = label.into();
+    d["reviews"] = json!([review]);
+    let mut app = gate_view(waiting(gate_summary("open", "ci")));
+    answer(&mut app, GATE_ID, Ok(d));
+    if !snapshot {
+        drop_snapshot(&mut app);
+    }
+    app
 }
 
 /// Dropping Role (with Cost) can free several lines at once; the freed
@@ -3521,7 +3939,7 @@ fn the_120x40_status_view_shows_the_aligned_table() {
         assert_eq!(&lines[i], e, "line {i}\n{s}");
     }
     assert_eq!(
-        lines[39], "e events  o PR  r retry  p pause  s send  c cancel  Esc back",
+        lines[39], "e events  o review  r retry  p pause  s send  c cancel  Esc back",
         "{s}"
     );
 }
@@ -3706,7 +4124,7 @@ fn search_tasks(app: &App) -> Vec<TaskSummary> {
         .chain(app.closed.iter())
         .cloned()
         .collect();
-    let mut old = with_pr(
+    let mut old = with_review(
         summary(
             ANCIENT,
             "Ancient migration fix",
@@ -4135,7 +4553,12 @@ fn long_fixture() -> Vec<TaskSummary> {
                 if i % 2 == 0 { "p-alpha" } else { "p-beta" },
             );
             if i % 3 == 0 {
-                t = with_pr(t, 1000 + i as u64);
+                let mut review = supplied_review();
+                review.label = match i {
+                    9 => LONG_LABEL.into(),
+                    _ => format!("!{}", 42 + i / 3),
+                };
+                t.reviews = vec![review];
             }
             t.task.created_at = mins_ago(i as i64);
             t
@@ -4147,8 +4570,8 @@ fn long_fixture() -> Vec<TaskSummary> {
 fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
     for all_projects in [true, false] {
         for last in [false, true] {
-            for h in [10u16, 24, 40] {
-                for w in 40u16..=120 {
+            for h in 10u16..=40 {
+                for w in 40u16..=140 {
                     let mut app = new_app(if all_projects {
                         Scope::AllProjects
                     } else {
@@ -4194,7 +4617,9 @@ fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
                         .collect::<Vec<_>>()
                         .join("\n");
                     assert!(rows.contains("▶ "), "{ctx}");
-                    assert_eq!(rows.contains('#'), w >= 80, "{ctx}");
+                    let label = if last { "group…" } else { "!42" };
+                    assert_eq!(rows.contains(label), w >= 80, "{ctx}");
+                    assert!(!rows.contains('#'), "{ctx}");
                     let status = ["open", "stuck", "closed", "cancelled"]
                         .iter()
                         .any(|s| rows.contains(s));

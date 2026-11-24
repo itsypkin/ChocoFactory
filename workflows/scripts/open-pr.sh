@@ -9,7 +9,8 @@
 # `eval`, `echo`, a format string, or a string that gets re-parsed.
 #
 # stdout carries ONLY the final read-back JSON (the stage is
-# `capture: json`). Everything else goes to /dev/null, a file, or stderr.
+# `kind: open_review`, whose capture is always JSON). Everything else goes to
+# /dev/null, a file, or stderr.
 # Notes are collected and written to stderr just before the read-back, so
 # the 2 KB `stderr_tail` on the timeline keeps them.
 #
@@ -601,8 +602,6 @@ fi
 
 # `gh pr create` has no `--json` flag, so the PR's number and url can only
 # be read back with a separate list. The trailing `grep .` is the
-# fail-closed half: an empty read-back would otherwise hand `capture: json`
-# a bare `null`, and the failure would surface much later as a template
-# error on `{{ stages.open_pr.number }}`. Failing here takes the `error`
-# edge instead.
+# fail-closed half: an empty read-back makes the script exit non-zero, so the
+# stage takes its `error` edge.
 gh pr list --head "$BRANCH" --state open --json number,url -q '.[0] // empty' | grep .

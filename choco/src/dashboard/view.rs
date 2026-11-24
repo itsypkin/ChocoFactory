@@ -2,7 +2,7 @@
 //! thing it writes back is the visible list height and scroll offset, which
 //! `update` needs for paging.
 
-use chocofactory_core::models::TaskSummary;
+use chocofactory_core::models::{TASK_STATUS_OPEN, TaskSummary};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::{
     LABEL_BASE, LABEL_CLOSES, LABEL_CREATED, LABEL_ID, LABEL_PAUSED, LABEL_PROJECT, LABEL_REPO,
-    LABEL_ROLE, LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW,
+    LABEL_REVIEW, LABEL_ROLE, LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW,
     LABEL_WORKFLOW_FILE,
 };
 
@@ -135,7 +135,7 @@ fn first_line(s: &str) -> &str {
 struct Cols {
     project: bool,
     stage: bool,
-    pr: bool,
+    review: bool,
     laps: bool,
     cost: bool,
 }
@@ -144,7 +144,7 @@ fn cols_for(app: &App, width: u16) -> Cols {
     Cols {
         project: app.all_projects() && width >= 60,
         stage: width >= 60,
-        pr: width >= 80,
+        review: width >= 80,
         laps: width >= 80,
         // 80 plus the column and its separator, so the title never has less
         // room than it has at 80.
@@ -159,7 +159,7 @@ enum Key {
     Title,
     Stage,
     Reason,
-    Pr,
+    Review,
     Time,
     Laps,
     Status,
@@ -182,7 +182,7 @@ struct Grid {
 }
 
 const ID_W: usize = 8;
-const PR_W: usize = 6;
+const REVIEW_W: usize = 6;
 const TIME_W: usize = 10;
 const LAPS_W: usize = 5;
 const COST_W: usize = 9;
@@ -230,7 +230,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
         0
     };
     let mut fixed_cols = vec![ID_W, TIME_W];
-    fixed_cols.extend([PR_W].into_iter().filter(|_| cols.pr));
+    fixed_cols.extend([REVIEW_W].into_iter().filter(|_| cols.review));
     fixed_cols.extend([LAPS_W].into_iter().filter(|_| cols.laps));
     fixed_cols.extend([COST_W].into_iter().filter(|_| cols.cost));
     let n = fixed_cols.len() + 1 + usize::from(cols.project) + usize::from(cols.stage);
@@ -274,9 +274,9 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
     }
 }
 
-/// The columns of one section's rows. The id, project, title, PR, time and
-/// laps columns sit at the same place in every section; a stuck task's
-/// reason takes the stage and PR columns' room.
+/// The columns of one section's rows. The id, project, title, review, time
+/// and laps columns sit at the same place in every section; a stuck task's
+/// reason takes the stage and review columns' room.
 fn columns(section: Section, g: &Grid) -> Vec<Col> {
     let c = |key, w| Col { key, w };
     let mut v = vec![c(Key::Id, ID_W)];
@@ -285,7 +285,7 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     }
     let mut title_w = g.title_w;
     let mut mid = None;
-    let mut pr = g.cols.pr;
+    let mut review = g.cols.review;
     match section {
         Section::NeedsYou | Section::InProgress | Section::Paused => {
             if g.cols.stage {
@@ -299,9 +299,9 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
         }
         Section::Stuck => {
             if g.cols.stage {
-                let w = g.stage_w + if pr { 2 + PR_W } else { 0 };
+                let w = g.stage_w + if review { 2 + REVIEW_W } else { 0 };
                 mid = Some(c(Key::Reason, w));
-                pr = false;
+                review = false;
             } else {
                 // Narrow: no stage column to borrow, so share the title's room.
                 let reason = (title_w.saturating_sub(2) / 2).min(24);
@@ -312,8 +312,8 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     }
     v.push(c(Key::Title, title_w));
     v.extend(mid);
-    if pr {
-        v.push(c(Key::Pr, PR_W));
+    if review {
+        v.push(c(Key::Review, REVIEW_W));
     }
     v.push(c(Key::Time, TIME_W));
     if g.cols.laps {
@@ -364,10 +364,10 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
         Key::Title => t.task.title.clone(),
         Key::Stage => stage_cell(t),
         Key::Reason => first_line(t.task.stuck_reason.as_deref().unwrap_or("")).to_string(),
-        Key::Pr => t
+        Key::Review => t
             .reviews
             .first()
-            .map(|r| format!("#{}", r.number))
+            .map(|r| r.label.clone())
             .unwrap_or_default(),
         Key::Time => match section {
             Section::NeedsYou | Section::InProgress => age(app, t.stage_entered_at),
@@ -431,7 +431,7 @@ fn heading_line(g: &Grid) -> String {
             Key::Project => "project",
             Key::Title => "title",
             Key::Stage => "stage",
-            Key::Pr => "PR",
+            Key::Review => LABEL_REVIEW,
             Key::Laps => "laps",
             Key::Cost => "cost",
             _ => "",
@@ -558,7 +558,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  s send  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o review  r retry  p pause  s send  c cancel  ? help  q quit",
     );
 }
 
@@ -743,20 +743,52 @@ impl FRow {
     }
 }
 
-fn waiting_text(stage: &str, id: &str) -> Option<String> {
-    match stage {
-        "awaiting_human_review" => Some(
-            "your verdict: a PR comment with /approve or /request-changes on its own line"
-                .to_string(),
+/// The `Waiting for` row's value: how to reply to the open human gate the
+/// task is at; `None` when it is at none.
+///
+/// The status, stage and "waiting" facts come from the snapshot when there
+/// is one, else from the loaded detail. The marker lines come only from the
+/// detail's `gate_markers`, and only while it is at the same stage; anything
+/// else that isn't a list of strings (not loaded yet, `null`, missing, the
+/// wrong type) reads as unavailable, never as a gate without markers.
+fn waiting_text(d: &Detail) -> Option<String> {
+    let data = d.data.as_ref();
+    let state = data.and_then(|v| v.get("workflow_state"));
+    let text = |v: Option<&'_ serde_json::Value>, key: &str| -> Option<String> {
+        v?.get(key)?.as_str().map(str::to_string)
+    };
+    let detail_stage = text(state, "current_stage");
+    let (status, at_gate, same_stage) = match &d.snapshot {
+        Some(t) => (
+            t.task.status.clone(),
+            t.waiting_on_human,
+            detail_stage.is_some() && detail_stage == t.current_stage,
         ),
-        "escalate_to_human" => Some(format!(
-            "a note to resume it: choco task send {id} --text \"…\""
-        )),
-        "spec_questions" => Some(format!(
-            "your answers to the spec check's questions: choco task send {id} --text \"…\""
-        )),
-        _ => None,
+        None => (
+            text(data, "status")?,
+            text(state, "stage_kind").as_deref() == Some("human_gate"),
+            true,
+        ),
+    };
+    if status != TASK_STATUS_OPEN {
+        return None;
     }
+    if !at_gate {
+        return None;
+    }
+    let markers: Option<Vec<&str>> = data
+        .filter(|_| same_stage)
+        .and_then(|v| v.get("gate_markers"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|lines| lines.iter().map(serde_json::Value::as_str).collect());
+    let send = format!("choco task send {} --text \"…\"", d.id);
+    Some(match markers {
+        None => {
+            format!("marker instructions unavailable, so a reply may be refused. Reply with {send}")
+        }
+        Some(lines) if lines.is_empty() => format!("a note: {send}"),
+        Some(lines) => format!("a marker on its own line ({}): {send}", lines.join(" or ")),
+    })
 }
 
 /// The rows of the fields block: `choco task status`'s rows from the last
@@ -834,8 +866,13 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         rows.insert(pos + 1, FRow::new(LABEL_PAUSED, value));
     }
 
-    // Stage, with the time in it (or how long ago it ended), then PR and
-    // what the task waits for.
+    // Stage, with the time in it (or how long ago it ended), then the review
+    // and what the task waits for. The review row is taken out so it can go
+    // back right after Stage wherever Stage ends up.
+    let review_row = rows
+        .iter()
+        .position(|r| r.label == LABEL_REVIEW)
+        .map(|pos| rows.remove(pos));
     let stage_name = snap
         .and_then(|t| t.current_stage.as_deref())
         .or_else(|| d.data.as_ref().and_then(crate::render::detail_stage));
@@ -874,22 +911,19 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         }
     };
     let mut extra = Vec::new();
-    if let Some(t) = snap {
-        if let Some(review) = t.reviews.first() {
-            extra.push(FRow::new(
-                "PR",
-                format!("#{} {}", review.number, review.url),
-            ));
-        }
-        if t.task.status == "open"
-            && let Some(stage) = t.current_stage.as_deref()
-            && t.waiting_on_human
-            && let Some(text) = waiting_text(stage, &t.task.id)
-        {
-            let mut row = FRow::new("Waiting for", text);
-            row.wrap = true;
-            extra.push(row);
-        }
+    // Once the detail has loaded, `task_fields` alone decides whether there
+    // is a review row; the snapshot only stands in until then.
+    extra.extend(match (&d.data, snap) {
+        (None, Some(t)) => t
+            .reviews
+            .first()
+            .map(|review| FRow::new(LABEL_REVIEW, crate::render::review_value(review))),
+        _ => review_row,
+    });
+    if let Some(text) = waiting_text(d) {
+        let mut row = FRow::new("Waiting for", text);
+        row.wrap = true;
+        extra.push(row);
     }
     let at = (at + 1).min(rows.len());
     let after = at + extra.len();
@@ -1289,9 +1323,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     draw_detail_body(frame, app, lines, area, STATUS_HINTS);
 }
 
-const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  s send  c cancel  Esc back";
+const STATUS_HINTS: &str = "e events  o review  r retry  p pause  s send  c cancel  Esc back";
 const EXPANDED_HINTS: &str =
-    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel";
+    "PgUp/PgDn scroll  End follow  e/Esc status  o review  r retry  p pause  s send  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1429,7 +1463,7 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     let fixed = ID_W
         + if cols.project { proj_w + 2 } else { 0 }
         + if cols.stage { 9 + 2 } else { 0 }
-        + if cols.pr { PR_W + 2 } else { 0 }
+        + if cols.review { REVIEW_W + 2 } else { 0 }
         + 2;
     let title_w = inner.saturating_sub(2 + fixed).max(1);
     for (i, t) in results.iter().enumerate().skip(off).take(rows_h) {
@@ -1441,12 +1475,9 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
         if cols.stage {
             parts.push(pad(&t.task.status, 9));
         }
-        if cols.pr {
-            let pr = t
-                .reviews
-                .first()
-                .map_or("-".to_string(), |r| format!("#{}", r.number));
-            parts.push(pad(&pr, PR_W));
+        if cols.review {
+            let label = t.reviews.first().map_or("-", |r| r.label.as_str());
+            parts.push(pad(label, REVIEW_W));
         }
         let selected = Some(i) == sel;
         let text = format!("{}{}", if selected { "▶ " } else { "  " }, parts.join("  "));
@@ -1510,7 +1541,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("↑ k / ↓ j   move            ⏎     open detail"),
         Line::from("PgUp PgDn   page            Esc   back"),
-        Line::from("g / G       top / bottom    o     open PR"),
+        Line::from("g / G       top / bottom    o     open review"),
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit            p     pause / resume"),

@@ -2968,6 +2968,48 @@ impl WorkflowEngine {
         })
     }
 
+    /// The reply-marker lines of the human gate `state` is at, in the order
+    /// the workflow declares them: `GET /tasks/{id}`'s `gate_markers`.
+    /// `Some([])` is a readable gate without markers. `None` is a stage
+    /// that isn't a human gate, no workflow state, or a definition that
+    /// can't be read now (logged), which is never reported as a gate without
+    /// markers. Read-only, and says nothing about whether the task takes a
+    /// reply: its status decides that.
+    pub(crate) async fn gate_markers(
+        &self,
+        task: &Task,
+        state: Option<&chocofactory_core::models::WorkflowState>,
+    ) -> Option<Vec<String>> {
+        let state = state?;
+        let stage = state.current_stage.as_str();
+        let workflow = task.workflow_path.as_deref().unwrap_or(&task.workflow_def);
+        let definition = match self.load_task_workflow(task).await {
+            Ok(definition) => definition,
+            Err(err) => {
+                tracing::warn!(
+                    task_id = %task.id, stage, workflow, %err,
+                    "could not load the workflow to read a gate's markers; \
+                     reporting gate_markers as null"
+                );
+                return None;
+            }
+        };
+        let Some(stage_def) = definition.stages.get(stage) else {
+            tracing::warn!(
+                task_id = %task.id, stage, workflow,
+                "the workflow no longer defines the task's current stage; \
+                 reporting gate_markers as null"
+            );
+            return None;
+        };
+        match &stage_def.kind {
+            StageKind::HumanGate { markers, .. } => {
+                Some(markers.iter().map(|marker| marker.line.clone()).collect())
+            }
+            _ => None,
+        }
+    }
+
     /// The place in line of `(task, stage)` of `group` when it is queued.
     /// Informational: a failed read is logged and reads as "not queued".
     pub(super) async fn queued_position(

@@ -9,8 +9,9 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use chocofactory_core::models::{
-    Event, PauseOutcome, Project, RetryOutcome, TASK_STATUS_CANCELLED, TASK_STATUS_CLOSED,
-    TASK_STATUS_OPEN, TASK_STATUS_PAUSED, TASK_STATUS_PAUSING, TASK_STATUS_STUCK, TaskSummary,
+    Event, PauseOutcome, Project, RetryOutcome, ReviewRef, TASK_STATUS_CANCELLED,
+    TASK_STATUS_CLOSED, TASK_STATUS_OPEN, TASK_STATUS_PAUSED, TASK_STATUS_PAUSING,
+    TASK_STATUS_STUCK, TaskSummary,
 };
 use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -900,7 +901,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             });
             return vec![Effect::LoadSearch { generation }];
         }
-        KeyCode::Char('o') => return open_pr(app),
+        KeyCode::Char('o') => return open_review(app),
         KeyCode::Char('r') => {
             retry_prompt(app);
             return Vec::new();
@@ -1104,26 +1105,35 @@ fn open_detail(app: &mut App, id: String, snapshot: Option<TaskSummary>) -> Vec<
     vec![Effect::FetchDetail(id.clone()), Effect::OpenSocket(id)]
 }
 
-fn open_pr(app: &mut App) -> Vec<Effect> {
-    let Some(id) = app.action_target() else {
+/// The review `o` acts on. In the detail view the loaded `GET /tasks/{id}`
+/// answer decides, even when it reports no review; the view's snapshot only
+/// stands in until one arrives. In the list it is the selected row's.
+fn selected_review(app: &App) -> Option<ReviewRef> {
+    match &app.view {
+        View::Detail(d) => match &d.data {
+            Some(detail) => crate::render::detail_review(detail),
+            None => d.snapshot.as_ref()?.reviews.first().cloned(),
+        },
+        View::List => app.find(app.selected.as_deref()?)?.reviews.first().cloned(),
+    }
+}
+
+fn open_review(app: &mut App) -> Vec<Effect> {
+    if app.action_target().is_none() {
         return Vec::new();
-    };
-    let pr = app
-        .find(&id)
-        .and_then(|t| t.reviews.first().cloned())
-        .or_else(|| match &app.view {
-            View::Detail(d) => d.snapshot.as_ref().and_then(|t| t.reviews.first().cloned()),
-            View::List => None,
-        });
-    let Some(pr) = pr else {
-        app.set_status("no PR yet", Level::Info);
+    }
+    let Some(review) = selected_review(app) else {
+        app.set_status("no review yet", Level::Info);
         return Vec::new();
     };
     if app.ssh {
-        app.set_status(format!("PR #{}: {}", pr.number, pr.url), Level::Info);
+        app.set_status(
+            format!("Review {}: {}", review.label, review.url),
+            Level::Info,
+        );
         return Vec::new();
     }
-    vec![Effect::OpenUrl(pr.url)]
+    vec![Effect::OpenUrl(review.url)]
 }
 
 fn target_summary(app: &App) -> Option<TaskSummary> {
