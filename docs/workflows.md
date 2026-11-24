@@ -697,6 +697,103 @@ awaiting_review:
   rather than a verdict.
 - An accepted reply stops the watcher.
 
+## Publishing a review: `open_review`
+
+A task's review (a pull request, a merge request) is whatever an
+`open_review` stage published. The stage runs a command like a `shell` stage
+does, and its output tells choco which review the task has. choco learns no
+forge: it never reads the shape of the URL and knows no GitHub or GitLab. A
+workflow that doesn't publish a review shows none.
+
+```yaml
+publish:
+  kind: open_review
+  script_file: publish.sh
+  timeout: 10m
+  on: { done: watch_review, error: gate }
+```
+
+- Keys: `command` or `script_file` (exactly one), `timeout` and `env`, besides
+  `on` and `loop_guard`. They work as they do for a `shell` stage, including
+  templates in an inline `command:` and in `env:` values (a `script_file`'s
+  contents are not templated).
+- `on:` needs `done`; `error` is optional. A workflow has at most one
+  `open_review` stage, and it is never a branch of a `parallel` stage.
+- There is no `capture:`. The capture is always JSON, and an explicit
+  `capture:` (even `capture: null`) is rejected when the workflow loads.
+
+### What the command prints
+
+When the command exits `0`, its whole standard output must be one JSON object:
+
+```json
+{"number": 7, "url": "https://github.com/acme/app/pull/7"}
+```
+
+```json
+{"number": 42, "url": "https://git.example.internal/group/proj/-/merge_requests/42", "label": "!42"}
+```
+
+- `number` is a positive integer that fits an unsigned 64-bit number.
+- `url` is a string starting with `http://` or `https://` (in any letter
+  case), with something after it and no whitespace anywhere in it. That is
+  all choco checks: it does not look at the host or the path, and it does not
+  fetch the URL.
+- `label` is optional: a nonempty string on a single line. Without one, choco
+  records `#<number>`, so after a successful publication `label` is always
+  there. A label you give is kept exactly as printed.
+- Every other field is kept as printed, and objects stay objects, whatever
+  their keys. Extra fields are stored as JSON values the way choco parses them,
+  so very large or very precise numbers may be rounded; a script that needs
+  exact digits prints them as a string.
+- The output, trimmed, may be at most 1 MiB, and nothing may come before or
+  after the object (no prose, no code fence, no second object).
+
+Output that breaks a rule is a failure of the stage with the reason on the
+timeline (`open_review output rejected: …`). The stage takes its `error` edge,
+or, without one, the task parks as stuck at the stage. A command that exits
+non-zero, is killed, times out or can't be started fails as a `shell` stage
+does: its output is not recorded as a new capture (the timeline still keeps
+the tail of what it printed), so the previous publication stays.
+
+### What choco records
+
+A valid object is the stage's capture, so later stages can use
+`{{ stages.publish.number }}`, `{{ stages.publish.url }}` and
+`{{ stages.publish.label }}` (pass them to a command through `env:`), and the
+task's `review_stage` points at the stage. The task list and `GET /tasks/<id>`
+report that capture as the task's one review. The pointer and the capture are
+written in the same transaction as the stage's departure.
+
+The review is the last *successful* publication. Entering the stage again,
+or a later attempt that fails, times out or is cancelled, leaves the previous
+one in place. Pruned timeline events don't remove it.
+
+### Restarts and retries
+
+An interrupted `open_review` stage parks like a `shell` stage when the daemon
+restarts, and `choco task retry` runs the command again from the start. The
+remote write may have succeeded before choco recorded it (or before the command
+timed out, was cancelled, or its output was rejected), and choco gives no
+exactly-once guarantee. A publishing script must therefore find and update the
+review it already opened, rather than open a second one, whenever it runs
+again.
+
+### Upgrading
+
+On upgrade, a task keeps one link it already had, as its review. choco takes
+the first stage, in the order the payload stores them, whose capture is an
+object with a `url` containing `/pull/`. That stage becomes the pointed stage
+and gets `number` and `label` from the URL, if the URL ends in
+`/pull/<number>`, with a lowercase `pull`, 1 to 18 digits, a number above zero
+and at most one trailing `/`. A task whose first such stage fails that test
+(for example `/pull/0`, a number of 19 or more digits, or a stage name that
+contains a `"`) gets no pointed review: choco doesn't look further down the
+list, and doesn't change that task's payload. A custom workflow that publishes from a
+`kind: shell` stage must change that stage to `kind: open_review`, and have the
+script print the object above, to keep showing a link for new tasks. choco does
+not bundle a GitLab command.
+
 ## Parallel stages
 
 A `kind: parallel` stage starts several agent turns (its *branches*) at the
@@ -777,7 +874,7 @@ The loader enforces these rules, and each failure names the stage:
 - A branch is an `agent_turn`. Shell and poll branches are not supported yet:
   `branch '{branch}' of parallel stage '{group}' is a {kind} stage; {kind}
   branches are supported in a later version, only agent_turn branches are for
-  now`. A `parallel`, `human_gate` or `terminal` branch is never allowed:
+  now`. A `parallel`, `human_gate`, `open_review` or `terminal` branch is never allowed:
   `…is a {kind} stage; a branch must be an agent_turn`. So groups don't nest.
 - A branch has no `on:` and no `loop_guard`. A group's own `done` edge is the
   only way out.

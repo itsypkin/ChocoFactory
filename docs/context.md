@@ -22,7 +22,7 @@ It holds:
 
 | field | meaning |
 |---|---|
-| `source_stage`, `source_kind` | the stage left, and its kind (`agent_turn`, `shell`, `poll`, `human_gate`, `parallel`) |
+| `source_stage`, `source_kind` | the stage left, and its kind (`agent_turn`, `shell`, `open_review`, `poll`, `human_gate`, `parallel`) |
 | `outcome` | the outcome applied. A group leaves with `done`; the gate-to-watcher retry is `retry` |
 | `destination_stage` | where the task actually went, after any loop-guard redirect |
 | `capture_present`, `capture` | the full value handed to the transition. `capture_present: true` with `capture: null` is a captured JSON null; `false` means nothing was captured (none declared, or over the 1 MiB capture limit) |
@@ -31,8 +31,8 @@ It holds:
 The newest result's ID is kept in the task's workflow payload as
 `current_result_id`. The stage's live text in the same payload (`stages.<name>`,
 what `choco task status` shows) is a different thing: it is removed when a new
-attempt of an agent-turn stage launches (a shell, poll or human-gate stage keeps
-its last text), so once an attempt is running it is never an
+attempt of an agent-turn stage launches (a shell, `open_review`, poll or
+human-gate stage keeps its last text), so once an attempt is running it is never an
 earlier attempt's verdict shown as the new one's, while the recorded results
 keep every applied verdict. (Before that — queued for a slot, held by a pause,
 or failed before launch — it is still the previous run's text.) History is ordered only by these links, never by
@@ -102,8 +102,8 @@ latest stored capture, marked as such. This is the only fallback, and it needs
 no `anchor_id`, no `result_id`, no `outcome`, and no `current_result_id`. That
 stored capture is the stage's live text. The daemon removes it when a new
 attempt of an agent-turn stage launches, so after that the answer for such a
-stage is `missing_snapshot` (a shell, poll or human-gate stage keeps its
-snapshot):
+stage is `missing_snapshot` (a shell, `open_review`, poll or human-gate stage
+keeps its snapshot):
 
 ```
 {"provenance":"snapshot","task_id":"…","anchor_id":null,"stage":"review",

@@ -364,11 +364,11 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
         Key::Title => t.task.title.clone(),
         Key::Stage => stage_cell(t),
         Key::Reason => first_line(t.task.stuck_reason.as_deref().unwrap_or("")).to_string(),
-        Key::Pr => {
-            t.pr.as_ref()
-                .map(|p| format!("#{}", p.number))
-                .unwrap_or_default()
-        }
+        Key::Pr => t
+            .reviews
+            .first()
+            .map(|r| format!("#{}", r.number))
+            .unwrap_or_default(),
         Key::Time => match section {
             Section::NeedsYou | Section::InProgress => age(app, t.stage_entered_at),
             // "paused for", from when the pause was asked for.
@@ -875,8 +875,11 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
     };
     let mut extra = Vec::new();
     if let Some(t) = snap {
-        if let Some(pr) = &t.pr {
-            extra.push(FRow::new("PR", format!("#{} {}", pr.number, pr.url)));
+        if let Some(review) = t.reviews.first() {
+            extra.push(FRow::new(
+                "PR",
+                format!("#{} {}", review.number, review.url),
+            ));
         }
         if t.task.status == "open"
             && let Some(stage) = t.current_stage.as_deref()
@@ -1439,9 +1442,10 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
             parts.push(pad(&t.task.status, 9));
         }
         if cols.pr {
-            let pr =
-                t.pr.as_ref()
-                    .map_or("-".to_string(), |p| format!("#{}", p.number));
+            let pr = t
+                .reviews
+                .first()
+                .map_or("-".to_string(), |r| format!("#{}", r.number));
             parts.push(pad(&pr, PR_W));
         }
         let selected = Some(i) == sel;

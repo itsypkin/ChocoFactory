@@ -11,9 +11,7 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use chocofactory_core::models::{
-    Project, PullRequestRef, RetryOutcome, Task, TaskSummary, UsageTotal,
-};
+use chocofactory_core::models::{Project, RetryOutcome, ReviewRef, Task, TaskSummary, UsageTotal};
 use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until, wait_until_blocking};
 use chrono::{DateTime, TimeZone, Utc};
 use ratatui::Terminal;
@@ -69,7 +67,7 @@ fn summary(
         current_stage: stage.map(str::to_string),
         stage_entered_at: entered_mins_ago.map(mins_ago),
         loop_counters: json!({}),
-        pr: None,
+        reviews: vec![],
         waiting_on_human: false,
         usage_total: None,
         branch_progress: None,
@@ -82,10 +80,12 @@ fn waiting(mut t: TaskSummary) -> TaskSummary {
 }
 
 fn with_pr(mut t: TaskSummary, n: u64) -> TaskSummary {
-    t.pr = Some(PullRequestRef {
+    t.reviews = vec![ReviewRef {
+        stage: "open_pr".into(),
         number: n,
         url: format!("https://github.com/o/r/pull/{n}"),
-    });
+        label: format!("#{n}"),
+    }];
     t
 }
 
@@ -3859,10 +3859,12 @@ fn printable_keys_are_typed_not_acted_on_over_the_list_and_the_detail() {
             .iter_mut()
             .find(|t| t.task.id == "7d22e1a8-dddd")
             .unwrap()
-            .pr = Some(PullRequestRef {
+            .reviews = vec![ReviewRef {
+            stage: "open_pr".into(),
             number: 5,
             url: "https://x/pull/5".into(),
-        });
+            label: "#5".into(),
+        }];
         ch(&mut app, 'G');
         ch(&mut app, 'k');
         if in_detail {

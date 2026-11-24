@@ -1,4 +1,6 @@
-use chocofactory_core::models::{BranchProgress, PullRequestRef, Task, TaskSummary, UsageTotal};
+use chocofactory_core::models::{
+    BranchProgress, REVIEW_STAGE_KEY, Task, TaskSummary, UsageTotal, review_ref,
+};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -181,7 +183,8 @@ struct SummaryRow {
     current_stage: Option<String>,
     stage_entered_at: Option<DateTime<Utc>>,
     loop_counters: Option<Json<Value>>,
-    pr_url: Option<String>,
+    review_stage: Option<String>,
+    review_capture: Option<String>,
     waiting_on_human: bool,
     branch_total: Option<i64>,
     branch_settled: Option<i64>,
@@ -191,18 +194,28 @@ struct SummaryRow {
     usage_turns_without_cost: Option<i64>,
 }
 
-/// The pull-request number at the end of a pull URL (`…/pull/42`, with an
-/// optional trailing slash). Anything else is `None`.
-fn pr_ref(url: String) -> Option<PullRequestRef> {
-    static PULL: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"/pull/(\d+)/?$").expect("valid regex"));
-    let number = PULL.captures(&url)?.get(1)?.as_str().parse().ok()?;
-    Some(PullRequestRef { number, url })
+/// The task's review, from the pointed stage's capture as the query selected
+/// them. Anything the query could not vouch for arrives as `NULL`, and a
+/// capture that is not a readable reference yields no review rather than an
+/// error: this is a projection, never a repair.
+fn review_of(
+    stage: Option<String>,
+    capture: Option<String>,
+) -> Vec<chocofactory_core::models::ReviewRef> {
+    let (Some(stage), Some(capture)) = (stage, capture) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Value>(&capture)
+        .ok()
+        .and_then(|capture| review_ref(&stage, &capture))
+        .into_iter()
+        .collect()
 }
 
-/// One query for `GET /tasks`: each task with its workflow facts and the
-/// first pull-request URL any stage captured. The URL is picked inside
-/// SQLite so the (large) payloads never reach Rust.
+/// One query for `GET /tasks`: each task with its workflow facts and its
+/// review: the capture of the one stage `payload.review_stage` names. The
+/// stage and its capture are picked inside SQLite so the (large) payloads
+/// never reach Rust.
 ///
 /// `statuses` empty means "any status".
 pub async fn list_summaries(
@@ -217,13 +230,24 @@ pub async fn list_summaries(
         .map(|c| format!("t.{}", c.trim()))
         .collect::<Vec<_>>()
         .join(", ");
+    // The pointed stage, when `stages` is an object, the pointer is text and
+    // that stage's capture is an object. Selecting `j.value` only under
+    // `j.type = 'object'` keeps a string capture from ever being read as JSON.
+    let review_pick = |column: &str| {
+        format!(
+            "(SELECT j.{column} FROM json_each(w.payload, '$.stages') j \
+              WHERE json_type(w.payload, '$.stages') = 'object' \
+                AND json_type(w.payload, '$.{REVIEW_STAGE_KEY}') = 'text' \
+                AND j.key = json_extract(w.payload, '$.{REVIEW_STAGE_KEY}') \
+                AND j.type = 'object' LIMIT 1)"
+        )
+    };
+    let review_pick_key = review_pick("key");
+    let review_pick_value = review_pick("value");
     let mut qb = QueryBuilder::new(format!(
         "SELECT {task_columns}, w.current_stage, w.stage_entered_at, w.loop_counters, \
-         (SELECT json_extract(j.value, '$.url') \
-            FROM json_each(w.payload, '$.stages') j \
-           WHERE j.type = 'object' \
-             AND json_extract(j.value, '$.url') LIKE '%/pull/%' \
-           LIMIT 1) AS pr_url, \
+         {review_pick_key} AS review_stage, \
+         {review_pick_value} AS review_capture, \
          COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human, \
          CASE WHEN w.stage_kind = 'parallel' \
          AND json_extract(w.payload, '$.parallel.stage') = w.current_stage \
@@ -285,7 +309,7 @@ pub async fn list_summaries(
                 .loop_counters
                 .map(|j| j.0)
                 .unwrap_or_else(|| serde_json::json!({})),
-            pr: row.pr_url.and_then(pr_ref),
+            reviews: review_of(row.review_stage, row.review_capture),
             waiting_on_human: row.waiting_on_human,
             usage_total: row
                 .usage_all_subscription

@@ -12,6 +12,7 @@ mod context_completion;
 mod gate_retry;
 mod model_level;
 mod omp_wake;
+mod open_review;
 mod parallel;
 mod parked_gates;
 mod pause;
@@ -15060,6 +15061,12 @@ async fn restart_effect_classifies_every_stage_kind() {
         restart_effect(&mixed.stages["sh"]),
         RestartEffect::StrandsShell
     );
+    // A review publisher is a shell stage to a restart.
+    let publisher = WorkflowDefinition::parse(open_review::PUBLISHER_FLOW, &dir).unwrap();
+    assert_eq!(
+        restart_effect(&publisher.stages["publish"]),
+        RestartEffect::StrandsShell
+    );
     assert_eq!(
         restart_effect(&mixed.stages["finished"]),
         RestartEffect::Survives
@@ -15548,11 +15555,13 @@ async fn in_flight_lists_only_what_a_restart_would_strand() {
     std::fs::write(dir.join("coder-turn.md"), "x").unwrap();
     std::fs::write(dir.join("mixed-flow.yaml"), MIXED_FLOW).unwrap();
     std::fs::write(dir.join("chat-flow.yaml"), CHAT_FLOW).unwrap();
+    std::fs::write(dir.join("review-flow.yaml"), open_review::PUBLISHER_FLOW).unwrap();
     write_poll_flow(&dir, "poll-flow", "echo PENDING", Some("1h"), false);
     let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
 
     let turn = open_task_at(&pool, &project_id, "mixed-flow", &dir, "turn").await;
     let sh = open_task_at(&pool, &project_id, "mixed-flow", &dir, "sh").await;
+    let publisher = open_task_at(&pool, &project_id, "review-flow", &dir, "publish").await;
     let unloadable = open_task_at(&pool, &project_id, "vanished-flow", &dir, "turn").await;
     let missing = open_task_at(&pool, &project_id, "mixed-flow", &dir, "ghost").await;
     for (flow, stage) in [
@@ -15579,6 +15588,7 @@ async fn in_flight_lists_only_what_a_restart_would_strand() {
     let mut expected = vec![
         (turn, "turn".to_string(), "agent_turn".to_string()),
         (sh, "sh".to_string(), "shell".to_string()),
+        (publisher, "publish".to_string(), "open_review".to_string()),
         (unloadable, "turn".to_string(), "unknown".to_string()),
         (missing, "ghost".to_string(), "unknown".to_string()),
     ];

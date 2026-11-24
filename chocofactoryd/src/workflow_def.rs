@@ -210,6 +210,22 @@ impl WorkflowDefinition {
             }
         }
 
+        let mut publishers = self.stages.iter().filter(|(_, stage)| {
+            matches!(
+                stage.kind,
+                StageKind::Shell {
+                    publishes_review: true,
+                    ..
+                }
+            )
+        });
+        if let (Some((first, _)), Some((second, _))) = (publishers.next(), publishers.next()) {
+            return Err(WorkflowDefError::MultipleReviewPublishers {
+                first: first.clone(),
+                second: second.clone(),
+            });
+        }
+
         for (stage_name, stage) in &self.stages {
             if let StageKind::Parallel { branches } = &stage.kind {
                 if branches.len() < 2 {
@@ -648,6 +664,10 @@ impl StageKind {
     pub fn name(&self) -> &'static str {
         match self {
             StageKind::AgentTurn { .. } => "agent_turn",
+            StageKind::Shell {
+                publishes_review: true,
+                ..
+            } => "open_review",
             StageKind::Shell { .. } => "shell",
             StageKind::Poll { .. } => "poll",
             StageKind::HumanGate { .. } => "human_gate",
@@ -694,6 +714,10 @@ pub enum StageKind {
         /// Values are templates, rendered once on stage entry and handed to
         /// the child as environment variables — never parsed by a shell.
         env: IndexMap<String, String>,
+        /// `true` for `kind: open_review`: a shell stage whose successful
+        /// stdout is validated as a review reference and whose departure
+        /// records the review pointer. Every `kind: shell` stage has `false`.
+        publishes_review: bool,
     },
     Poll {
         capture: Option<Capture>,
@@ -900,6 +924,7 @@ fn stage_kind_keys(kind: &str) -> Option<&'static [&'static str]> {
     Some(match kind {
         "agent_turn" => &["role", "prompt_file", "capture", "report_sections"],
         "shell" => &["command", "script_file", "capture", "timeout", "env"],
+        "open_review" => &["command", "script_file", "timeout", "env"],
         "poll" => &[
             "command",
             "script_file",
@@ -1028,6 +1053,22 @@ enum RawStageKind {
         )]
         env: IndexMap<String, String>,
     },
+    /// A shell stage that publishes the task's review (see `StageKind::Shell`
+    /// with `publishes_review`). Deliberately has no `capture` field: its
+    /// capture is always JSON.
+    OpenReview {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        script_file: Option<String>,
+        #[serde(default)]
+        timeout: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+        )]
+        env: IndexMap<String, String>,
+    },
     Poll {
         #[serde(default)]
         command: Option<String>,
@@ -1148,25 +1189,31 @@ impl RawStage {
                 capture,
                 timeout,
                 env,
-            } => {
-                let resolved_command = resolve_command(base_dir, stage_name, command, script_file)?;
-                StageKind::Shell {
-                    command: resolved_command,
-                    capture,
-                    env,
-                    timeout: timeout
-                        .map(|value| {
-                            parse_duration(&value).map_err(|value| {
-                                WorkflowDefError::InvalidDuration {
-                                    stage: stage_name.to_string(),
-                                    field: "timeout",
-                                    value,
-                                }
-                            })
-                        })
-                        .transpose()?,
-                }
-            }
+            } => resolve_shell(
+                base_dir,
+                stage_name,
+                command,
+                script_file,
+                capture,
+                timeout,
+                env,
+                false,
+            )?,
+            RawStageKind::OpenReview {
+                command,
+                script_file,
+                timeout,
+                env,
+            } => resolve_shell(
+                base_dir,
+                stage_name,
+                command,
+                script_file,
+                Some(Capture::Json),
+                timeout,
+                env,
+                true,
+            )?,
             RawStageKind::Poll {
                 command,
                 script_file,
@@ -1274,6 +1321,7 @@ impl RawStage {
             }
             RawStageKind::Parallel { .. }
             | RawStageKind::HumanGate { .. }
+            | RawStageKind::OpenReview { .. }
             | RawStageKind::Terminal => {
                 return Err(WorkflowDefError::BranchKindNeverAllowed {
                     group: group.to_string(),
@@ -1329,6 +1377,7 @@ impl RawStageKind {
         match self {
             RawStageKind::AgentTurn { .. } => "agent_turn",
             RawStageKind::Shell { .. } => "shell",
+            RawStageKind::OpenReview { .. } => "open_review",
             RawStageKind::Poll { .. } => "poll",
             RawStageKind::HumanGate { .. } => "human_gate",
             RawStageKind::Terminal => "terminal",
@@ -1614,6 +1663,37 @@ fn resolve_command(
             stage: stage_name.to_string(),
         }),
     }
+}
+
+/// Resolves a `shell` or `open_review` stage; they differ only in whether the
+/// stage publishes the review (and so in where `capture` comes from).
+#[allow(clippy::too_many_arguments)]
+fn resolve_shell(
+    base_dir: &Path,
+    stage_name: &str,
+    command: Option<String>,
+    script_file: Option<String>,
+    capture: Option<Capture>,
+    timeout: Option<String>,
+    env: IndexMap<String, String>,
+    publishes_review: bool,
+) -> Result<StageKind, WorkflowDefError> {
+    let command = resolve_command(base_dir, stage_name, command, script_file)?;
+    Ok(StageKind::Shell {
+        command,
+        capture,
+        env,
+        timeout: timeout
+            .map(|value| {
+                parse_duration(&value).map_err(|value| WorkflowDefError::InvalidDuration {
+                    stage: stage_name.to_string(),
+                    field: "timeout",
+                    value,
+                })
+            })
+            .transpose()?,
+        publishes_review,
+    })
 }
 
 /// Whether a stage keeps anything in `workflow_state.payload` — i.e. whether
@@ -1917,6 +1997,11 @@ pub enum WorkflowDefError {
         group: String,
         branch: String,
         kind: &'static str,
+    },
+    /// Two `open_review` stages: a task has one review to point at.
+    MultipleReviewPublishers {
+        first: String,
+        second: String,
     },
     BranchResultsNeedJsonCapture {
         group: String,
@@ -2233,6 +2318,11 @@ impl fmt::Display for WorkflowDefError {
                 "branch '{branch}' of parallel stage '{group}' is a {kind} stage; a branch must \
                  be an agent_turn"
             ),
+            WorkflowDefError::MultipleReviewPublishers { first, second } => write!(
+                f,
+                "the workflow has more than one open_review stage ('{first}' and '{second}'); a \
+                 task records a single review, so only one stage may publish it"
+            ),
             WorkflowDefError::BranchResultsNeedJsonCapture { group, branch } => write!(
                 f,
                 "branch '{branch}' of parallel stage '{group}' lists 'results:' other than \
@@ -2371,6 +2461,9 @@ impl fmt::Display for WorkflowDefError {
 impl std::error::Error for WorkflowDefError {}
 
 #[cfg(test)]
+mod open_review_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2388,6 +2481,10 @@ stages:
   b:
     kind: shell
     command: "true"
+    on: { done: b2 }
+  b2:
+    kind: open_review
+    command: "true"
     on: { done: c }
   c:
     kind: poll
@@ -2404,23 +2501,30 @@ stages:
     kind: terminal
 "#;
         let def = WorkflowDefinition::parse(yaml, Path::new(".")).unwrap();
-        let names: Vec<_> = ["a", "b", "c", "d", "e"]
+        let names: Vec<_> = ["a", "b", "b2", "c", "d", "e"]
             .iter()
             .map(|s| def.stages[*s].kind.name())
             .collect();
         assert_eq!(
             names,
-            ["agent_turn", "shell", "poll", "human_gate", "terminal"]
+            [
+                "agent_turn",
+                "shell",
+                "open_review",
+                "poll",
+                "human_gate",
+                "terminal"
+            ]
         );
     }
     use std::io::Write;
 
-    struct TempDir {
+    pub(super) struct TempDir {
         path: PathBuf,
     }
 
     impl TempDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("chocofactoryd-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
@@ -2432,6 +2536,13 @@ stages:
             let mut file = fs::File::create(&path).unwrap();
             file.write_all(contents.as_bytes()).unwrap();
             path
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.path
         }
     }
 
@@ -5043,6 +5154,11 @@ stages:
                 "shell",
                 "intervall",
                 "    kind: shell\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "open_review",
+                "intervall",
+                "    kind: open_review\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
             ),
             (
                 "terminal",

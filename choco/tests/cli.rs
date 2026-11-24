@@ -2887,7 +2887,7 @@ async fn task_list_search_json_rows_are_whole() {
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], full);
-    assert!(rows[0].get("pr").is_some() && rows[0].get("usage_total").is_some());
+    assert!(rows[0].get("reviews").is_some() && rows[0].get("usage_total").is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -3611,7 +3611,7 @@ impl FxTask {
         row["current_stage"] = self.stage().into();
         row["stage_entered_at"] = Value::Null;
         row["loop_counters"] = serde_json::json!({});
-        row["pr"] = Value::Null;
+        row["reviews"] = serde_json::json!([]);
         row
     }
 

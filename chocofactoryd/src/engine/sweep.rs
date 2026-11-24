@@ -540,47 +540,60 @@ impl WorkflowEngine {
                 continue;
             }
             let kind = match self.load_task_workflow(&task).await {
-                Ok(definition) => match definition.stages.get(&stage).map(restart_effect) {
-                    Some(RestartEffect::PerBranch) if pausing => {
-                        // A pausing task's queue rows are not admissible and
-                        // so not in the snapshot: read them directly.
-                        let rows = crate::db::turn_queue::list(&self.pool).await?;
-                        match super::parallel::running_branch_kinds(
-                            &state.payload,
-                            &definition,
-                            &stage,
-                            |branch| {
-                                rows.iter()
-                                    .any(|r| r.task_id == task.id && r.stage == branch)
-                            },
-                        ) {
-                            Some(kind) => kind,
-                            None => continue,
+                Ok(definition) => {
+                    // What a stranded command runner is called: a review
+                    // publisher is a shell stage that says so.
+                    let command_kind = match definition.stages.get(&stage).map(|def| &def.kind) {
+                        Some(StageKind::Shell {
+                            publishes_review: true,
+                            ..
+                        }) => "open_review",
+                        _ => "shell",
+                    };
+                    match definition.stages.get(&stage).map(restart_effect) {
+                        Some(RestartEffect::PerBranch) if pausing => {
+                            // A pausing task's queue rows are not admissible and
+                            // so not in the snapshot: read them directly.
+                            let rows = crate::db::turn_queue::list(&self.pool).await?;
+                            match super::parallel::running_branch_kinds(
+                                &state.payload,
+                                &definition,
+                                &stage,
+                                |branch| {
+                                    rows.iter()
+                                        .any(|r| r.task_id == task.id && r.stage == branch)
+                                },
+                            ) {
+                                Some(kind) => kind,
+                                None => continue,
+                            }
                         }
-                    }
-                    Some(_) if pausing => if permits { "agent_turn" } else { "shell" }.to_string(),
-                    Some(RestartEffect::Survives) => continue,
-                    Some(RestartEffect::PerBranch) => {
-                        match super::parallel::running_branch_kinds(
-                            &state.payload,
-                            &definition,
-                            &stage,
-                            |branch| queue.is_queued(&task.id, branch, Some(&stage), None),
-                        ) {
-                            Some(kind) => kind,
-                            None => continue,
+                        Some(_) if pausing => {
+                            if permits { "agent_turn" } else { command_kind }.to_string()
                         }
+                        Some(RestartEffect::Survives) => continue,
+                        Some(RestartEffect::PerBranch) => {
+                            match super::parallel::running_branch_kinds(
+                                &state.payload,
+                                &definition,
+                                &stage,
+                                |branch| queue.is_queued(&task.id, branch, Some(&stage), None),
+                            ) {
+                                Some(kind) => kind,
+                                None => continue,
+                            }
+                        }
+                        // Waiting for a slot is not running: nothing is stranded.
+                        Some(RestartEffect::StrandsAgentTurn)
+                            if queue.is_queued(&task.id, &stage, None, None) =>
+                        {
+                            continue;
+                        }
+                        Some(RestartEffect::StrandsAgentTurn) => "agent_turn".to_string(),
+                        Some(RestartEffect::StrandsShell) => command_kind.to_string(),
+                        None => "unknown".to_string(),
                     }
-                    // Waiting for a slot is not running: nothing is stranded.
-                    Some(RestartEffect::StrandsAgentTurn)
-                        if queue.is_queued(&task.id, &stage, None, None) =>
-                    {
-                        continue;
-                    }
-                    Some(RestartEffect::StrandsAgentTurn) => "agent_turn".to_string(),
-                    Some(RestartEffect::StrandsShell) => "shell".to_string(),
-                    None => "unknown".to_string(),
-                },
+                }
                 Err(err) => {
                     tracing::warn!(
                         task_id = %task.id,

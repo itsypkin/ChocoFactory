@@ -27,7 +27,14 @@ pub const CURRENT_RESULT_ID_KEY: &str = "current_result_id";
 
 /// The stage kinds a task can leave, spelled as workflow YAML spells them.
 /// `terminal` is a destination only and never departs.
-pub const DEPARTING_KINDS: [&str; 5] = ["agent_turn", "shell", "poll", "human_gate", "parallel"];
+pub const DEPARTING_KINDS: [&str; 6] = [
+    "agent_turn",
+    "shell",
+    "open_review",
+    "poll",
+    "human_gate",
+    "parallel",
+];
 
 /// A stored stage result, or the pointer to one, has a shape this version
 /// does not write.
@@ -74,7 +81,7 @@ pub fn set_current_result_id(payload: &mut Value, result_id: &str) {
 pub struct StageResultPayload {
     pub source_stage: String,
     /// The source stage's kind as workflow YAML spells it (`agent_turn`,
-    /// `shell`, `poll`, `human_gate` or `parallel`).
+    /// `shell`, `open_review`, `poll`, `human_gate` or `parallel`).
     pub source_kind: String,
     /// The outcome the engine actually applied.
     pub outcome: String,
