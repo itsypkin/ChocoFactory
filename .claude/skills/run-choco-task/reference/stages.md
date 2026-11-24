@@ -114,7 +114,10 @@ Read this while watching a task, when its behaviour surprises you.
   line is moved out (a live line the new text also has is simply still in the
   new block), and a line deleted by hand is not kept either; a body with
   no single block is left entirely unchanged and nothing is moved (details in
-  [docs/coding-task.md](../../../../docs/coding-task.md#editing-the-pr-body-by-hand)).
+  [docs/coding-task.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/coding-task.md#editing-the-pr-body-by-hand)).
+  It is an `open_review` stage: the PR's number and URL it prints become the
+  task's review (the `Review` row of `choco task status`). A later lap that
+  fails to publish leaves the earlier link in place.
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
   It goes green when every check passed or was skipped. It goes red on a
   failed, errored or timed-out check, as soon as one has finished. Only if the

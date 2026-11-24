@@ -291,7 +291,7 @@ choco task create --project <p> --workflow coding-task-planned \
   `--role-cli <role>=<cli>`. A model may end in an effort level, for example
   `--role-model coder=claude-sonnet-5-5:xhigh` (`low`, `medium`, `high`,
   `xhigh`, `max`); set effort only this way. See
-  [docs/models.md](../../../docs/models.md#effort-level).
+  [docs/models.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#effort-level).
 - After creating, compare the `Base` line in `choco task status` with the
   commit you wrote the spec against. If they differ and the commits between
   them touch files the spec names, check the spec still holds.
@@ -331,12 +331,19 @@ choco task create --project <p> --workflow coding-task-planned \
   Every report, and watching
   commits while a revise lap is still open, are in
   [reference/watch.md](reference/watch.md#reading-a-stages-verdict-text).
-- **Find the task's PR** with `gh pr list --head task/<task-id>` (add
-  `--state all` once it is merged or closed). The plain `choco task status`
-  doesn't print it, but `choco --json task status <id>` carries it as
-  `.workflow_state.payload.stages.open_pr.url` once `open_pr` has run.
-  Going the other way, `choco task list --search '#<n>'` finds the task behind
-  PR `<n>`.
+- **Find the task's PR** in the `Review` row of `choco task status <id>`
+  (label and URL), or print just the URL with
+  `choco --json task status <id> | jq -r '.reviews[0].url // empty'`. It is
+  there once a publication succeeded. Printing nothing means choco has recorded
+  no review for the task, not that there is no PR: ask GitHub with
+  `gh pr list --head task/<task-id>` (add `--state all` once it is merged or
+  closed).
+  Going the other way, `choco task list --search '#<n>'` (`'!<n>'` is the same;
+  bare `<n>` also matches task ids starting with it) lists the tasks whose
+  review has that number. The list shows no link, and the number can repeat
+  across repos, so narrow it with `--project` and check the `Review` row of
+  `choco task status <id>` before you act on a task. A review number is not a
+  task id: `<id>` arguments don't take it.
 - **Read the newest events** by running
   `${CLAUDE_SKILL_DIR}/scripts/tail-events.sh <task-id> [n]` (needs `jq`).
   `choco task events` is oldest first, so `choco task events | tail` shows
