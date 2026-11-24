@@ -94,7 +94,9 @@ Lines can't be empty, duplicated or padded with whitespace. Same section as
 above.
 
 The dashboard shows the current gate's marker lines with the
-`choco task send` command, from the workflow as it reads then. That is
+`choco task send` command, from the workflow as it reads then. It writes
+characters it can't show as themselves (a tab, a run of spaces, a backslash)
+as `\u{…}` codes; the reply needs the character, not the code. That is
 guidance: it doesn't mean the gate watches anything, and the daemon decides
 whether a reply is accepted.
 

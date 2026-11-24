@@ -16,7 +16,7 @@ use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until, wait_until_blocking}
 use chrono::{DateTime, TimeZone, Utc};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -159,16 +159,37 @@ fn ids(v: &[&TaskSummary]) -> Vec<String> {
     v.iter().map(|t| t.task.id.clone()).collect()
 }
 
+/// What the cells `from..to` of row `y` show. A wide character covers the
+/// cell after it, so that cell is skipped.
+fn row_text(buf: &Buffer, y: u16, from: u16, to: u16) -> String {
+    let mut out = String::new();
+    let mut x = from;
+    while x < to {
+        let symbol = buf[(x, y)].symbol();
+        out.push_str(symbol);
+        x += symbol.cell_width().max(1);
+    }
+    out
+}
+
 fn screen(buf: &Buffer) -> String {
     let mut out = String::new();
     for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            out.push_str(buf[(x, y)].symbol());
-        }
+        out.push_str(&row_text(buf, y, 0, buf.area.width));
         out.push('\n');
     }
     out
 }
+
+/// The terminal cells `s` takes on a rendered line.
+fn cells(s: &str) -> usize {
+    ratatui::text::Line::from(s).width()
+}
+
+/// Six characters in twelve cells: twice what the review column holds.
+const WIDE_LABEL: &str = "界界界界界界";
+/// Twelve characters in six cells: it fills the review column exactly.
+const COMBINING_LABEL: &str = "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}";
 
 fn render(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -539,6 +560,23 @@ fn o_over_ssh_and_normally_with_and_without_a_review() {
     assert!(s.contains(&said), "{s}");
     app.ssh = false;
     assert_eq!(ch(&mut app, 'o'), vec![Effect::OpenUrl(MERGE_URL.into())]);
+
+    // A label of wide characters: the line is cut by cells, and says so.
+    app.ssh = true;
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == "3f2a91c0-aaaa")
+        .unwrap()
+        .reviews[0]
+        .label = WIDE_LABEL.into();
+    assert!(ch(&mut app, 'o').is_empty());
+    let s = render(&app, 40, 10);
+    let said = s.lines().last().unwrap().trim_end();
+    assert!(
+        said.starts_with(&format!("Review {WIDE_LABEL}: https://")) && said.ends_with('…'),
+        "{s}"
+    );
+    assert_eq!(cells(said), 40, "{s}");
 }
 
 #[test]
@@ -954,6 +992,10 @@ struct Fake {
     messages: Arc<Mutex<Vec<(String, String)>>>,
     /// How that route answers.
     reply: Reply,
+    /// When set, what `GET /tasks/{id}` answers, listed or not.
+    detail: Option<Arc<Value>>,
+    /// The id of each `GET /tasks/{id}`, in order.
+    detail_requests: Arc<Mutex<Vec<String>>>,
     /// `"list"` for each `GET /tasks`, `"post"` for each message, in order.
     events: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -1008,6 +1050,10 @@ async fn fake_server(state: Fake) -> String {
     async fn task(State(s): State<Fake>, Path(id): Path<String>) -> axum::Json<Value> {
         if s.hang {
             std::future::pending::<()>().await;
+        }
+        s.detail_requests.lock().unwrap().push(id.clone());
+        if let Some(detail) = &s.detail {
+            return axum::Json(detail.as_ref().clone());
         }
         let t = s.tasks.iter().find(|t| t.task.id == id).unwrap();
         let mut v = serde_json::to_value(t).unwrap();
@@ -1681,8 +1727,16 @@ where
     F: FnOnce(Arc<Mutex<String>>, mpsc::UnboundedSender<KeyEvent>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    run_app_against(new_app(Scope::AllProjects), url, config, driver).await;
+}
+
+/// [`run_against`] for an app already in some state.
+async fn run_app_against<F, Fut>(mut app: App, url: String, config: LoopConfig, driver: F)
+where
+    F: FnOnce(Arc<Mutex<String>>, mpsc::UnboundedSender<KeyEvent>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let client = Arc::new(Client::new(url).without_version_check());
-    let mut app = new_app(Scope::AllProjects);
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&latest);
@@ -2462,6 +2516,191 @@ fn only_an_open_gate_gets_a_waiting_row() {
     }
 }
 
+/// Marker lines the daemon takes only exactly, with how the hint writes each.
+/// chocofactoryd's `a_marker_is_matched_exactly_with_its_unusual_characters`
+/// sends the same lines through the messages API.
+const EXACT_MARKERS: [(&str, &str); 4] = [
+    ("ship  now", r"ship\u{20}\u{20}now"),
+    ("ship\tit\u{a0}today", r"ship\u{9}it\u{a0}today"),
+    (r"keep\back: yes", r"keep\u{5c}back: yes"),
+    ("hold\u{200b}back", r"hold\u{200b}back"),
+];
+
+/// What a person types for a shown marker: each `\u{hex}` as its character.
+fn typed_marker(shown: &str) -> String {
+    let mut pieces = shown.split("\\u{");
+    let mut out = pieces.next().unwrap().to_string();
+    for piece in pieces {
+        let (hex, rest) = piece.split_once('}').unwrap();
+        out.push(char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap());
+        out.push_str(rest);
+    }
+    out
+}
+
+#[test]
+fn a_marker_is_shown_so_that_it_can_be_typed_exactly() {
+    let lines = EXACT_MARKERS.map(|(line, _)| line);
+    let app = detail_only(gate_detail(json!(lines)));
+    let s = render(&app, 160, 30);
+    let want = format!(
+        "a marker on its own line ({}; for each \\u{{…}} type the one character with that hex \
+         code, 20 = space, 9 = tab): {}",
+        EXACT_MARKERS.map(|(_, shown)| shown).join(" or "),
+        send_command()
+    );
+    let row = waiting_row(&s).expect(&s);
+    assert_eq!(row, want, "{s}");
+    let list = &row[row.find('(').unwrap() + 1..row.find("; for each").unwrap()];
+    let back: Vec<String> = list.split(" or ").map(typed_marker).collect();
+    assert_eq!(back, lines, "{s}");
+
+    // One marker with a code is enough to say what the codes are, and a
+    // plain one beside it reads as itself.
+    let app = detail_only(gate_detail(json!(["choco: accept", "ship  now"])));
+    let s = render(&app, 160, 30);
+    let row = waiting_row(&s).expect(&s);
+    assert!(
+        row.contains(r"(choco: accept or ship\u{20}\u{20}now; for each "),
+        "{s}"
+    );
+}
+
+#[test]
+fn every_character_a_screen_cannot_show_is_written_as_its_code() {
+    // Each end of each range of invisible characters, a control character
+    // and whitespace that is not a space.
+    for c in [
+        '\u{ad}', '\u{200b}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2060}', '\u{206f}',
+        '\u{feff}', '\u{1b}', '\u{7f}', '\u{2003}', '\u{3000}',
+    ] {
+        let line = format!("a{c}b");
+        let want = format!("a{}b", c.escape_unicode());
+        assert_eq!(super::view::shown_marker(&line), want);
+    }
+    // Spaces: alone between others it stays, otherwise it is written out.
+    for (line, want) in [
+        ("a b c", "a b c"),
+        ("a   b", r"a\u{20}\u{20}\u{20}b"),
+        (" a ", r"\u{20}a\u{20}"),
+        ("a \tb", r"a \u{9}b"),
+        // Visible characters of any script stay as they are.
+        ("承認 e\u{301}!", "承認 e\u{301}!"),
+    ] {
+        assert_eq!(super::view::shown_marker(line), want, "{line:?}");
+    }
+}
+
+#[test]
+fn a_hint_with_wide_markers_wraps_by_terminal_cells() {
+    let marker = ["承認します"; 8].join(" ");
+    let app = detail_only(gate_detail(json!([marker])));
+    let want = format!("a marker on its own line ({marker}): {}", send_command());
+    // Counted by characters, these lines would run off the right edge.
+    for w in [80, 100, 120] {
+        let s = render(&app, w, 30);
+        assert_eq!(waiting_row(&s).as_ref(), Some(&want), "{w}\n{s}");
+    }
+}
+
+#[test]
+fn wide_project_and_stage_names_get_columns_measured_in_cells() {
+    // Fourteen cells in seven characters.
+    let project = "工房工房工房工";
+    let stage = "確認確認確認確認";
+    let mut row = gate_summary("open", stage);
+    row.task.title = "Wide names".into();
+    let mut app = new_app(Scope::AllProjects);
+    app.projects.insert("p-alpha".into(), project.into());
+    load(&mut app, vec![row.clone()], vec![]);
+    let s = render(&app, 140, 20);
+    let line = s.lines().find(|l| l.contains("Wide names")).expect(&s);
+    assert!(line.contains(project), "list project\n{s}");
+    assert!(line.contains(stage), "list stage\n{s}");
+
+    let g = open_search(&mut app);
+    deliver(&mut app, g, vec![row.clone()]);
+    let s = render(&app, 140, 20);
+    let line = s.lines().find(|l| l.contains('▶') && l.contains('│'));
+    assert!(line.expect(&s).contains(project), "popup project\n{s}");
+
+    // A narrow screen shrinks the stage column, but not past a group's
+    // progress: twelve cells in eight characters here.
+    row.current_stage = Some("確認確認".into());
+    row.branch_progress = progress_of(1, 3);
+    let mut app = new_app(Scope::AllProjects);
+    app.projects.insert("p-alpha".into(), "web".into());
+    load(&mut app, vec![row], vec![]);
+    let s = render(&app, 60, 20);
+    assert!(s.contains("確認確認 1/3"), "{s}");
+}
+
+#[tokio::test]
+async fn a_detail_with_no_snapshot_shows_what_the_real_loop_fetched() {
+    // The list never has the task, so the view can't get a snapshot.
+    let mut app = gate_view(gate_summary("open", "accept_change"));
+    drop_snapshot(&mut app);
+    app.ssh = true;
+    app.interval = Duration::from_millis(50);
+    let mut other = with_review(gate_summary("open", "accept_change"), 7);
+    other.task.id = "0ther000-aaaa".into();
+    other.task.title = "Another task".into();
+    let fake = Fake {
+        tasks: Arc::new(vec![other]),
+        detail: Some(Arc::new(gate_detail(json!([
+            "choco: changes",
+            "choco: accept"
+        ])))),
+        ..Default::default()
+    };
+    let url = fake_server(fake.clone()).await;
+    let said = format!("Review !42: {MERGE_URL}");
+    run_app_against(
+        app,
+        url,
+        search_config(LOAD_ALLOWANCE),
+        |latest, ktx| async move {
+            wait_until("the fetched gate hint", || {
+                let shown = latest.lock().unwrap().clone();
+                async move {
+                    if waiting_row(&shown) == Some(marked_hint()) {
+                        Ok(())
+                    } else {
+                        Err(format!("screen:\n{shown}"))
+                    }
+                }
+            })
+            .await;
+            let s = latest.lock().unwrap().clone();
+            let rows: Vec<&str> = s
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| l.starts_with("Review ") || l.starts_with("PR "))
+                .collect();
+            assert_eq!(rows, [format!("Review       !42 {MERGE_URL}")], "{s}");
+            assert_eq!(s.matches(MERGE_URL).count(), 1, "{s}");
+            // With a snapshot the row would also say how long it has been.
+            assert!(
+                s.lines()
+                    .any(|l| l.trim_end() == "Stage        accept_change"),
+                "{s}"
+            );
+            assert!(!s.contains(&said), "{s}");
+            ktx.send(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+                .unwrap();
+            wait_for(&latest, &said).await;
+            // The first `q` leaves the detail view, the second the loop.
+            quit(&ktx);
+            quit(&ktx);
+        },
+    )
+    .await;
+    // The screen's data came over the real detail request, for this task.
+    let requested = fake.detail_requests.lock().unwrap();
+    assert!(!requested.is_empty());
+    assert!(requested.iter().all(|id| id == GATE_ID), "{requested:?}");
+}
+
 #[test]
 fn a_snapshot_at_another_stage_withholds_the_old_gates_markers() {
     let old = || gate_detail(json!(["choco: old-verdict"]));
@@ -3222,11 +3461,18 @@ fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() 
     ] {
         give_usage(&mut app, id, 1.234, "api_equivalent");
     }
-    for (id, label) in [("3f2a91c0-aaaa", "!42"), ("9c03aa17-bbbb", LONG_LABEL)] {
+    let labelled = [
+        ("3f2a91c0-aaaa", "!42"),
+        ("9c03aa17-bbbb", LONG_LABEL),
+        ("b81e0d44-cccc", WIDE_LABEL),
+        ("61b0f2e3-eeee", COMBINING_LABEL),
+    ];
+    for (id, label) in labelled {
         let mut review = supplied_review();
         review.label = label.into();
         app.active
             .iter_mut()
+            .chain(app.closed.iter_mut())
             .find(|t| t.task.id == id)
             .unwrap()
             .reviews = vec![review];
@@ -3243,14 +3489,26 @@ fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() 
     for w in 40..=140u16 {
         for h in 10..=40u16 {
             for line in render(&app, w, h).lines() {
-                assert!(line.trim_end().chars().count() <= w as usize, "{w}x{h}");
+                assert!(cells(line.trim_end()) <= usize::from(w), "{w}x{h}");
             }
         }
         let s = render(&app, w, 30);
         // The heading fits its column; a label that doesn't is clipped as
         // supplied, never rebuilt from the number.
-        for want in ["Review", "!42", "group…"] {
+        for want in ["Review", "!42", "group…", COMBINING_LABEL] {
             assert_eq!(s.contains(want), w >= 80, "{w}: {want}\n{s}");
+        }
+        // The wide label is cut to the column's six cells.
+        assert_eq!(s.contains("界界…"), w >= 80, "{w}\n{s}");
+        assert!(!s.contains("界界界"), "{w}\n{s}");
+        // Whatever the label, the columns after it start at the same cell.
+        if w >= 91 {
+            let cost_at: Vec<usize> = s
+                .lines()
+                .filter_map(|l| l.find("≈$1.23").map(|i| cells(&l[..i])))
+                .collect();
+            assert_eq!(cost_at.len(), 5, "{w}\n{s}");
+            assert!(cost_at.iter().all(|at| *at == cost_at[0]), "{w}\n{s}");
         }
         assert!(!s.contains("#42") && !s.contains("#1234567"), "{w}\n{s}");
         assert_eq!(s.contains("cost"), w >= 91, "{w}\n{s}");
@@ -3794,7 +4052,7 @@ fn the_detail_view_keeps_its_invariants_at_every_size() {
     for (markers, hint, label, snapshot) in [
         (marked, marked_hint(), "!42", true),
         (json!([]), note, LONG_LABEL, false),
-        (Value::Null, unavailable_hint(), "!42", false),
+        (Value::Null, unavailable_hint(), WIDE_DETAIL_LABEL, false),
     ] {
         let app = long_gate_view(markers, label, snapshot);
         for w in 40..=140u16 {
@@ -3802,11 +4060,17 @@ fn the_detail_view_keeps_its_invariants_at_every_size() {
                 assert_detail_invariants(&app, w, h, false);
             }
             let s = render(&app, w, 40);
-            // The row is the supplied label and URL, clipped at the edge.
+            // The row is the supplied label and URL; where the screen is too
+            // narrow in cells, it is cut at the edge and says so.
             let review = format!("Review       {label} {MERGE_URL}");
             let line = s.lines().find(|l| l.starts_with("Review ")).expect(&s);
-            let line = line.trim_end().trim_end_matches('…');
-            assert!(review.starts_with(line) && line.contains(label), "{w}\n{s}");
+            let line = line.trim_end();
+            if cells(&review) > usize::from(w) {
+                let kept = line.strip_suffix('…').expect(&s);
+                assert!(review.starts_with(kept) && kept.contains(label), "{w}\n{s}");
+            } else {
+                assert_eq!(line, review, "{w}\n{s}");
+            }
             if w >= 100 {
                 assert_eq!(waiting_row(&s).as_ref(), Some(&hint), "{w}\n{s}");
             }
@@ -3815,6 +4079,8 @@ fn the_detail_view_keeps_its_invariants_at_every_size() {
 }
 
 const LONG_LABEL: &str = "group/proj!1234567";
+/// Ten wide characters and a combining one: 21 cells in 12 characters.
+const WIDE_DETAIL_LABEL: &str = "界界界界界界界界界界e\u{301}";
 
 /// [`long_detail`] at an open gate with a published review.
 fn long_gate_view(gate_markers: Value, label: &str, snapshot: bool) -> App {
@@ -4572,6 +4838,8 @@ fn long_fixture() -> Vec<TaskSummary> {
             if i % 3 == 0 {
                 let mut review = supplied_review();
                 review.label = match i {
+                    3 => WIDE_LABEL.into(),
+                    6 => COMBINING_LABEL.into(),
                     9 => LONG_LABEL.into(),
                     _ => format!("!{}", 42 + i / 3),
                 };
@@ -4586,6 +4854,7 @@ fn long_fixture() -> Vec<TaskSummary> {
 #[test]
 fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
     for all_projects in [true, false] {
+        // The first row selected, then the last, which scrolls to the end.
         for last in [false, true] {
             for h in 10u16..=40 {
                 for w in 40u16..=140 {
@@ -4610,9 +4879,17 @@ fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
                     let want = if last { s.results().len() - 1 } else { 0 };
                     s.selected = Some(s.results()[want].task.id.clone());
                     app.search = Some(s);
-                    let text = render(&app, w, h);
+                    let buf = render_buf(&app, w, h);
+                    let text = screen(&buf);
                     let ctx = format!("{w}x{h} all={all_projects} last={last}\n{text}");
-                    let lines: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+                    // One entry per cell, so a column is the same on every row.
+                    let lines: Vec<Vec<char>> = (0..h)
+                        .map(|y| {
+                            (0..w)
+                                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                                .collect()
+                        })
+                        .collect();
                     let top = lines
                         .iter()
                         .position(|l| {
@@ -4628,14 +4905,27 @@ fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
                         assert_eq!((row[x0], row[x1]), ('│', '│'), "{ctx}");
                     }
                     // Result rows only: skip input, count and hint lines.
-                    let rows: String = lines[top + 3..bottom - 1]
-                        .iter()
-                        .map(|r| r[x0 + 1..x1].iter().collect::<String>())
+                    let rows: String = (top + 3..bottom - 1)
+                        .map(|y| row_text(&buf, y as u16, x0 as u16 + 1, x1 as u16))
                         .collect::<Vec<_>>()
                         .join("\n");
                     assert!(rows.contains("▶ "), "{ctx}");
                     let label = if last { "group…" } else { "!42" };
                     assert_eq!(rows.contains(label), w >= 80, "{ctx}");
+                    // The tallest screen shows every row. The review column
+                    // is the last, so a row ends with its label, cut with `…`
+                    // when it takes more cells than the column has.
+                    if h == 40 {
+                        for (id, label) in [
+                            ("id00000", "!42"),
+                            ("id00003", "界界…"),
+                            ("id00006", COMBINING_LABEL),
+                            ("id00009", "group…"),
+                        ] {
+                            let row = rows.lines().find(|l| l.contains(id)).expect(&ctx);
+                            assert_eq!(row.trim_end().ends_with(label), w >= 80, "{id} {ctx}");
+                        }
+                    }
                     assert!(!rows.contains('#'), "{ctx}");
                     let status = ["open", "stuck", "closed", "cancelled"]
                         .iter()

@@ -833,7 +833,15 @@ In the status view, an `open` task waiting at a human gate has a `Waiting for`
 row. It always gives the command, with the task's id:
 `choco task send <id> --text "…"`. Before it, the row says one of:
 
-- the gate's marker lines, to use on a line of their own;
+- the gate's marker lines, to use on a line of their own, joined with ` or `.
+  The daemon accepts a marker only exactly, so a character the screen can't show
+  as itself is written `\u{…}`, with its hex code: every space in a run of two
+  or more, a tab or any other whitespace, a control character, common invisible
+  characters such as a zero-width space, and a backslash. Other single spaces
+  are spaces. When a marker has such a code, the row says so: type the one
+  character instead of the code (`20` is a space, `9` a tab). To get a tab into
+  `--text` from bash or zsh, quote the whole text as `$'…\t…'`. `gate_markers`
+  has the lines as they are;
 - `a note`, for a gate without markers (a reply made up only of another gate's
   marker lines is still [refused](workflows.md#a-human-gate-that-watches-for-its-answer));
 - `marker instructions unavailable, so a reply may be refused`, when the lines

@@ -5,9 +5,10 @@
 use chocofactory_core::models::{TASK_STATUS_OPEN, TaskSummary};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::{
@@ -85,26 +86,78 @@ fn error_style(app: &App) -> Style {
 
 // ---- text helpers -------------------------------------------------------
 
-/// Cuts `s` to `w` characters, ending in `…` when something was dropped.
-pub fn fit(s: &str, w: usize) -> String {
-    let s: String = s
-        .chars()
+/// `s` with each control character as the space it is shown as.
+fn printable(s: &str) -> String {
+    s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if s.chars().count() <= w {
+        .collect()
+}
+
+/// The terminal cells one grapheme takes, as ratatui draws it.
+fn grapheme_cells(grapheme: &str) -> usize {
+    usize::from(grapheme.cell_width())
+}
+
+/// The terminal cells `s` takes: not its character count, since a wide
+/// character takes two and a combining mark none.
+fn cell_len(s: &str) -> usize {
+    // One cell each, without the cost of splitting into graphemes: this runs
+    // for every field of every frame.
+    if s.is_ascii() {
+        return s.len();
+    }
+    Span::raw(s)
+        .styled_graphemes(Style::default())
+        .map(|g| grapheme_cells(g.symbol))
+        .sum()
+}
+
+/// `s` in pieces of at most `w` cells, cut between graphemes. A grapheme
+/// wider than `w` is a piece of its own.
+fn chunk_cells(s: &str, w: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0;
+    for g in Span::raw(s).styled_graphemes(Style::default()) {
+        let n = grapheme_cells(g.symbol);
+        if used + n > w && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        cur.push_str(g.symbol);
+        used += n;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Cuts `s` to `w` cells, ending in `…` when something was dropped.
+pub fn fit(s: &str, w: usize) -> String {
+    let s = printable(s);
+    if cell_len(&s) <= w {
         return s;
     }
     if w == 0 {
         return String::new();
     }
-    let mut out: String = s.chars().take(w - 1).collect();
+    let mut used = 0;
+    let span = Span::raw(s.as_str());
+    let mut out: String = span
+        .styled_graphemes(Style::default())
+        .map_while(|g| {
+            used += grapheme_cells(g.symbol);
+            (used < w).then_some(g.symbol)
+        })
+        .collect();
     out.push('…');
     out
 }
 
 fn pad(s: &str, w: usize) -> String {
     let mut out = fit(s, w);
-    let n = out.chars().count();
+    let n = cell_len(&out);
     out.extend(std::iter::repeat_n(' ', w.saturating_sub(n)));
     out
 }
@@ -195,7 +248,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
         sections
             .iter()
             .flatten()
-            .map(|t| app.project_label(&t.task.project_id).chars().count())
+            .map(|t| cell_len(&app.project_label(&t.task.project_id)))
             .max()
             .unwrap_or(7)
             .clamp(7, 14)
@@ -209,7 +262,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
             .flat_map(|(ts, s)| ts.iter().map(move |t| (s, t)))
             .filter_map(|(s, t)| match s {
                 Section::NeedsYou | Section::InProgress | Section::Paused => {
-                    Some(stage_cell(t).chars().count())
+                    Some(cell_len(&stage_cell(t)))
                 }
                 Section::Closed => Some(t.task.status.chars().count()),
                 Section::Stuck => None,
@@ -257,7 +310,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
             .map(|t| {
                 // A waiting turn's `· queued N` is the point of its cell.
                 let most = if t.queued.is_empty() { 22 } else { 30 };
-                stage_cell(t).chars().count().clamp(6, most)
+                cell_len(&stage_cell(t)).clamp(6, most)
             })
             .max()
             .unwrap_or(0)
@@ -743,6 +796,58 @@ impl FRow {
     }
 }
 
+/// Characters that put nothing on screen that a reader could tell apart.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+/// A marker line as the hint shows it. The daemon accepts a marker only
+/// exactly, so none of it may be collapsed or left to guess. A space is shown
+/// as itself only between two characters that are not spaces. Any other space,
+/// other whitespace, control and invisible characters are written `\u{hex}`.
+/// A backslash is written that way too, so every backslash shown starts one.
+/// The result has no run of spaces, so word wrapping leaves it as it is.
+pub(super) fn shown_marker(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let before = i.checked_sub(1).map(|p| chars[p]);
+        let escape = match c {
+            ' ' => [before, chars.get(i + 1).copied()]
+                .iter()
+                .any(|next| next.is_none_or(|n| n == ' ')),
+            '\\' => true,
+            _ => c.is_whitespace() || c.is_control() || is_invisible(c),
+        };
+        if escape {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The hint for a gate with these marker lines, before the send command.
+fn marker_hint(lines: &[&str]) -> String {
+    let shown: Vec<String> = lines.iter().map(|l| shown_marker(l)).collect();
+    // Said only when something is written as a code: typed as shown, such a
+    // marker would be refused.
+    let codes = if shown.iter().zip(lines).any(|(s, l)| s != l) {
+        "; for each \\u{…} type the one character with that hex code, 20 = space, 9 = tab"
+    } else {
+        ""
+    };
+    format!("a marker on its own line ({}{codes})", shown.join(" or "))
+}
+
 /// The `Waiting for` row's value: how to reply to the open human gate the
 /// task is at; `None` when it is at none.
 ///
@@ -787,7 +892,7 @@ fn waiting_text(d: &Detail) -> Option<String> {
             format!("marker instructions unavailable, so a reply may be refused. Reply with {send}")
         }
         Some(lines) if lines.is_empty() => format!("a note: {send}"),
-        Some(lines) => format!("a marker on its own line ({}): {send}", lines.join(" or ")),
+        Some(lines) => format!("{}: {send}", marker_hint(&lines)),
     })
 }
 
@@ -1456,7 +1561,7 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     };
     let proj_w = loaded
         .iter()
-        .map(|t| app.project_label(&t.task.project_id).chars().count())
+        .map(|t| cell_len(&app.project_label(&t.task.project_id)))
         .max()
         .unwrap_or(0)
         .clamp(7, 14);
@@ -1503,27 +1608,26 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     }
 }
 
-/// Word wrap. A token longer than a line ends the current line and is split
-/// into `w`-character chunks, the last of which later words may join. Empty
-/// input is one empty line.
+/// Word wrap to `w` cells. A token longer than a line ends the current line
+/// and is split into `w`-cell chunks, the last of which later words may join.
+/// Empty input is one empty line.
 fn wrap_words(s: &str, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
-    for word in s.split_whitespace() {
-        let n = word.chars().count();
+    // Measured as `fit` will show it, control characters as spaces.
+    for word in printable(s).split_whitespace() {
+        let n = cell_len(word);
         if n > w {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
             }
-            let chars: Vec<char> = word.chars().collect();
-            let mut chunks = chars.chunks(w).map(|c| c.iter().collect::<String>());
-            let last = chunks.next_back().unwrap_or_default();
+            let mut chunks = chunk_cells(word, w);
+            cur = chunks.pop().unwrap_or_default();
             lines.extend(chunks);
-            cur = last;
             continue;
         }
-        if !cur.is_empty() && cur.chars().count() + 1 + n > w {
+        if !cur.is_empty() && cell_len(&cur) + 1 + n > w {
             lines.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -1564,5 +1668,27 @@ mod wrap_tests {
     fn empty_input_is_one_empty_line() {
         assert_eq!(wrap_words("", 10), [""]);
         assert_eq!(wrap_words("   ", 0), [""]);
+    }
+
+    #[test]
+    fn lines_are_filled_by_terminal_cells_not_characters() {
+        // Two cells each: five characters and a space would take eleven.
+        assert_eq!(wrap_words("界界界 界界", 10), ["界界界", "界界"]);
+        // A long token is cut between characters, none of them split.
+        assert_eq!(wrap_words("界界界界界 x", 5), ["界界", "界界", "界 x"]);
+        // A character wider than the line still ends up somewhere.
+        assert_eq!(wrap_words("界界", 1), ["界", "界"]);
+        // A combining mark takes no cell.
+        let e = "e\u{301}";
+        let word = e.repeat(4);
+        assert_eq!(
+            wrap_words(&format!("{word} {word}"), 9),
+            [format!("{word} {word}")]
+        );
+    }
+
+    #[test]
+    fn a_control_character_is_measured_as_the_space_it_is_shown_as() {
+        assert_eq!(wrap_words("ab\u{1b}cd", 4), ["ab", "cd"]);
     }
 }
