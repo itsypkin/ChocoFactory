@@ -521,6 +521,11 @@ fn o_over_ssh_and_normally_with_and_without_a_review() {
         assert_eq!(app.status.as_ref().unwrap().text, "no review yet");
     }
 
+    // With nothing selected there is nothing to say.
+    let mut empty = new_app(Scope::AllProjects);
+    assert!(ch(&mut empty, 'o').is_empty());
+    assert!(empty.status.is_none());
+
     ch(&mut app, 'k'); // 3f2a…
     app.active
         .iter_mut()
@@ -2230,10 +2235,18 @@ fn the_supplied_label_and_url_reach_the_list_search_and_detail() {
     assert!(s.contains("Review"), "{s}");
 
     let g = open_search(&mut app);
-    deliver(&mut app, g, vec![row.clone()]);
+    let mut unpublished = row.clone();
+    unpublished.task.id = "0ther000-aaaa".into();
+    unpublished.task.title = "Nothing published".into();
+    unpublished.reviews = vec![];
+    deliver(&mut app, g, vec![row.clone(), unpublished]);
+    let s = render(&app, 120, 30);
+    let bare = s.lines().find(|l| l.contains("0ther000")).expect(&s);
+    let cell = bare.trim_end_matches([' ', '│']);
+    assert!(cell.ends_with("  -"), "{s}");
     typed(&mut app, "!42");
     let s = render(&app, 120, 30);
-    assert!(s.contains("1 of 1 tasks"), "{s}");
+    assert!(s.contains("1 of 2 tasks"), "{s}");
     // The query line repeats `!42`: look at the result row alone.
     let result = s.lines().find(|l| l.contains('▶') && l.contains('│'));
     check("search", result.expect(&s));
