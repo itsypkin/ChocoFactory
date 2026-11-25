@@ -3921,8 +3921,8 @@ fn a_wide_review_label_cuts_the_detail_row_by_cells() {
     let label = "界界界界界界界界界界e\u{301}";
     detail["reviews"][0]["label"] = json!(label);
     let app = detail_only(detail);
-    // By characters the row would fit in 70 columns; in cells it doesn't.
-    let s = render(&app, 70, 30);
+    // The row is 78 characters but 87 cells: only by characters does it fit.
+    let s = render(&app, 80, 30);
     let review = format!("Review       {label} {MERGE_URL}");
     let line = s.lines().find(|l| l.starts_with("Review ")).expect(&s);
     let kept = line.trim_end().strip_suffix('…').expect(&s);
