@@ -1655,7 +1655,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::{FRow, lone_space_words, row_lines, wrap_words};
+    use super::{FRow, fit, lone_space_words, row_lines, wrap_words};
+
+    #[test]
+    fn fit_shows_a_control_character_in_ordinary_text_as_a_space() {
+        assert_eq!(fit("a\tb", 5), "a b");
+    }
 
     #[test]
     fn a_verbatim_row_cut_at_its_last_line_is_not_made_printable() {
