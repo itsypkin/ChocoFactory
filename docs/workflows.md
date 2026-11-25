@@ -698,8 +698,7 @@ awaiting_review:
 - An accepted reply stops the watcher.
 - `GET /tasks/<id>` reports the current gate's marker lines as
   [`gate_markers`](cli.md#a-full-walkthrough), and `choco dashboard` shows them
-  in the [`Waiting for` row](cli.md#the-dashboard) (which writes characters it
-  can't show, such as a tab or a double space, as codes). Showing them doesn't check
+  in the [`Waiting for` row](cli.md#the-dashboard). Showing them doesn't check
   a reply; the rules above do, when it is sent. Neither says that the gate has
   a `watch:`, or what it watches.
 

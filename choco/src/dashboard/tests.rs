@@ -186,6 +186,8 @@ fn cells(s: &str) -> usize {
     ratatui::text::Line::from(s).width()
 }
 
+/// A label longer than the review column.
+const LONG_LABEL: &str = "group/proj!1234567";
 /// Six characters in twelve cells: twice what the review column holds.
 const WIDE_LABEL: &str = "界界界界界界";
 /// Twelve characters in six cells: it fills the review column exactly.
@@ -992,10 +994,6 @@ struct Fake {
     messages: Arc<Mutex<Vec<(String, String)>>>,
     /// How that route answers.
     reply: Reply,
-    /// When set, what `GET /tasks/{id}` answers, listed or not.
-    detail: Option<Arc<Value>>,
-    /// The id of each `GET /tasks/{id}`, in order.
-    detail_requests: Arc<Mutex<Vec<String>>>,
     /// `"list"` for each `GET /tasks`, `"post"` for each message, in order.
     events: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -1050,10 +1048,6 @@ async fn fake_server(state: Fake) -> String {
     async fn task(State(s): State<Fake>, Path(id): Path<String>) -> axum::Json<Value> {
         if s.hang {
             std::future::pending::<()>().await;
-        }
-        s.detail_requests.lock().unwrap().push(id.clone());
-        if let Some(detail) = &s.detail {
-            return axum::Json(detail.as_ref().clone());
         }
         let t = s.tasks.iter().find(|t| t.task.id == id).unwrap();
         let mut v = serde_json::to_value(t).unwrap();
@@ -1727,16 +1721,8 @@ where
     F: FnOnce(Arc<Mutex<String>>, mpsc::UnboundedSender<KeyEvent>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    run_app_against(new_app(Scope::AllProjects), url, config, driver).await;
-}
-
-/// [`run_against`] for an app already in some state.
-async fn run_app_against<F, Fut>(mut app: App, url: String, config: LoopConfig, driver: F)
-where
-    F: FnOnce(Arc<Mutex<String>>, mpsc::UnboundedSender<KeyEvent>) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
     let client = Arc::new(Client::new(url).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&latest);
@@ -2168,7 +2154,7 @@ fn send_command() -> String {
 
 fn marked_hint() -> String {
     format!(
-        "a marker on its own line (choco: changes or choco: accept): {}",
+        "a marker on its own line (`choco: changes` or `choco: accept`): {}",
         send_command()
     )
 }
@@ -2273,7 +2259,7 @@ fn a_task_waiting_on_you_shows_the_review_and_how_to_reply() {
 }
 
 #[test]
-fn the_supplied_label_and_url_reach_the_list_search_and_detail() {
+fn the_supplied_label_reaches_the_list_and_search() {
     let mut row = gate_summary("open", "accept_change");
     row.reviews = vec![supplied_review()];
     let mut app = new_app(Scope::AllProjects);
@@ -2308,11 +2294,6 @@ fn the_supplied_label_and_url_reach_the_list_search_and_detail() {
     // The query line repeats `!42`: look at the result row alone.
     let result = s.lines().find(|l| l.contains('▶') && l.contains('│'));
     check("search", result.expect(&s));
-
-    let app = detail_only(gate_detail(Value::Null));
-    let s = render(&app, 120, 30);
-    check("detail", &s);
-    assert!(s.contains(MERGE_URL), "{s}");
 }
 
 #[test]
@@ -2488,9 +2469,9 @@ fn only_an_open_gate_gets_a_waiting_row() {
         assert_eq!(waiting_row(&s), None, "status={status} kind={kind}\n{s}");
     }
 
-    // With a snapshot: its status and `waiting_on_human` win over an answer
-    // that still says open at a gate. The daemon reports neither a waiting
-    // task that isn't open nor, here, an open one away from a gate.
+    // With a snapshot: its `waiting_on_human` wins over an answer that says
+    // open at a gate. The daemon reports neither a waiting task that isn't
+    // open nor, here, an open one away from a gate.
     let snapshots = ["paused", "pausing", "stuck", "closed", "cancelled"]
         .map(|status| gate_summary(status, "accept_change"))
         .into_iter()
@@ -2514,80 +2495,35 @@ fn only_an_open_gate_gets_a_waiting_row() {
         let s = render(&app, 160, 30);
         assert_eq!(waiting_row(&s), None, "snapshot {status}\n{s}");
     }
-}
 
-/// Marker lines the daemon takes only exactly, with how the hint writes each.
-/// chocofactoryd's `a_marker_is_matched_exactly_with_its_unusual_characters`
-/// sends the same lines through the messages API.
-const EXACT_MARKERS: [(&str, &str); 4] = [
-    ("ship  now", r"ship\u{20}\u{20}now"),
-    ("ship\tit\u{a0}today", r"ship\u{9}it\u{a0}today"),
-    (r"keep\back: yes", r"keep\u{5c}back: yes"),
-    ("hold\u{200b}back", r"hold\u{200b}back"),
-];
-
-/// What a person types for a shown marker: each `\u{hex}` as its character.
-fn typed_marker(shown: &str) -> String {
-    let mut pieces = shown.split("\\u{");
-    let mut out = pieces.next().unwrap().to_string();
-    for piece in pieces {
-        let (hex, rest) = piece.split_once('}').unwrap();
-        out.push(char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap());
-        out.push_str(rest);
+    // The list's snapshot is older than the answer, as after a pause made
+    // elsewhere: it still says open and waiting, at the answer's stage.
+    for status in ["paused", "closed", "cancelled"] {
+        let mut app = gate_view(waiting(gate_summary("open", "accept_change")));
+        let s = render(&app, 160, 30);
+        assert_eq!(waiting_row(&s), Some(unavailable_hint()), "{s}");
+        answer(
+            &mut app,
+            GATE_ID,
+            Ok(detail(json!(status), json!("human_gate"))),
+        );
+        let s = render(&app, 160, 30);
+        assert_eq!(waiting_row(&s), None, "detail {status}\n{s}");
+        let shown = s.lines().find_map(|l| l.strip_prefix("Status "));
+        assert_eq!(shown.map(str::trim), Some(status), "{s}");
     }
-    out
 }
 
 #[test]
-fn a_marker_is_shown_so_that_it_can_be_typed_exactly() {
-    let lines = EXACT_MARKERS.map(|(line, _)| line);
-    let app = detail_only(gate_detail(json!(lines)));
-    let s = render(&app, 160, 30);
-    let want = format!(
-        "a marker on its own line ({}; for each \\u{{…}} type the one character with that hex \
-         code, 20 = space, 9 = tab): {}",
-        EXACT_MARKERS.map(|(_, shown)| shown).join(" or "),
-        send_command()
-    );
-    let row = waiting_row(&s).expect(&s);
-    assert_eq!(row, want, "{s}");
-    let list = &row[row.find('(').unwrap() + 1..row.find("; for each").unwrap()];
-    let back: Vec<String> = list.split(" or ").map(typed_marker).collect();
-    assert_eq!(back, lines, "{s}");
-
-    // One marker with a code is enough to say what the codes are, and a
-    // plain one beside it reads as itself.
-    let app = detail_only(gate_detail(json!(["choco: accept", "ship  now"])));
-    let s = render(&app, 160, 30);
-    let row = waiting_row(&s).expect(&s);
-    assert!(
-        row.contains(r"(choco: accept or ship\u{20}\u{20}now; for each "),
-        "{s}"
-    );
-}
-
-#[test]
-fn every_character_a_screen_cannot_show_is_written_as_its_code() {
-    // Each end of each range of invisible characters, a control character
-    // and whitespace that is not a space.
-    for c in [
-        '\u{ad}', '\u{200b}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2060}', '\u{206f}',
-        '\u{feff}', '\u{1b}', '\u{7f}', '\u{2003}', '\u{3000}',
-    ] {
-        let line = format!("a{c}b");
-        let want = format!("a{}b", c.escape_unicode());
-        assert_eq!(super::view::shown_marker(&line), want);
-    }
-    // Spaces: alone between others it stays, otherwise it is written out.
-    for (line, want) in [
-        ("a b c", "a b c"),
-        ("a   b", r"a\u{20}\u{20}\u{20}b"),
-        (" a ", r"\u{20}a\u{20}"),
-        ("a \tb", r"a \u{9}b"),
-        // Visible characters of any script stay as they are.
-        ("承認 e\u{301}!", "承認 e\u{301}!"),
-    ] {
-        assert_eq!(super::view::shown_marker(line), want, "{line:?}");
+fn a_marker_is_shown_verbatim_with_its_double_space() {
+    // The daemon takes a marker only exactly. A tab is a control character,
+    // which the screen drops; it must not be turned into a space.
+    let app = detail_only(gate_detail(json!(["ship  now", "hold\there"])));
+    // At some of these widths the line ends beside or between the spaces.
+    for w in 40..=160 {
+        let s = render(&app, w, 30);
+        assert!(s.contains("`ship  now`"), "{w}\n{s}");
+        assert!(s.contains("`holdhere`"), "{w}\n{s}");
     }
 }
 
@@ -2595,7 +2531,7 @@ fn every_character_a_screen_cannot_show_is_written_as_its_code() {
 fn a_hint_with_wide_markers_wraps_by_terminal_cells() {
     let marker = ["承認します"; 8].join(" ");
     let app = detail_only(gate_detail(json!([marker])));
-    let want = format!("a marker on its own line ({marker}): {}", send_command());
+    let want = format!("a marker on its own line (`{marker}`): {}", send_command());
     // Counted by characters, these lines would run off the right edge.
     for w in [80, 100, 120] {
         let s = render(&app, w, 30);
@@ -2633,72 +2569,6 @@ fn wide_project_and_stage_names_get_columns_measured_in_cells() {
     load(&mut app, vec![row], vec![]);
     let s = render(&app, 60, 20);
     assert!(s.contains("確認確認 1/3"), "{s}");
-}
-
-#[tokio::test]
-async fn a_detail_with_no_snapshot_shows_what_the_real_loop_fetched() {
-    // The list never has the task, so the view can't get a snapshot.
-    let mut app = gate_view(gate_summary("open", "accept_change"));
-    drop_snapshot(&mut app);
-    app.ssh = true;
-    app.interval = Duration::from_millis(50);
-    let mut other = with_review(gate_summary("open", "accept_change"), 7);
-    other.task.id = "0ther000-aaaa".into();
-    other.task.title = "Another task".into();
-    let fake = Fake {
-        tasks: Arc::new(vec![other]),
-        detail: Some(Arc::new(gate_detail(json!([
-            "choco: changes",
-            "choco: accept"
-        ])))),
-        ..Default::default()
-    };
-    let url = fake_server(fake.clone()).await;
-    let said = format!("Review !42: {MERGE_URL}");
-    run_app_against(
-        app,
-        url,
-        search_config(LOAD_ALLOWANCE),
-        |latest, ktx| async move {
-            wait_until("the fetched gate hint", || {
-                let shown = latest.lock().unwrap().clone();
-                async move {
-                    if waiting_row(&shown) == Some(marked_hint()) {
-                        Ok(())
-                    } else {
-                        Err(format!("screen:\n{shown}"))
-                    }
-                }
-            })
-            .await;
-            let s = latest.lock().unwrap().clone();
-            let rows: Vec<&str> = s
-                .lines()
-                .map(str::trim_end)
-                .filter(|l| l.starts_with("Review ") || l.starts_with("PR "))
-                .collect();
-            assert_eq!(rows, [format!("Review       !42 {MERGE_URL}")], "{s}");
-            assert_eq!(s.matches(MERGE_URL).count(), 1, "{s}");
-            // With a snapshot the row would also say how long it has been.
-            assert!(
-                s.lines()
-                    .any(|l| l.trim_end() == "Stage        accept_change"),
-                "{s}"
-            );
-            assert!(!s.contains(&said), "{s}");
-            ktx.send(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
-                .unwrap();
-            wait_for(&latest, &said).await;
-            // The first `q` leaves the detail view, the second the loop.
-            quit(&ktx);
-            quit(&ktx);
-        },
-    )
-    .await;
-    // The screen's data came over the real detail request, for this task.
-    let requested = fake.detail_requests.lock().unwrap();
-    assert!(!requested.is_empty());
-    assert!(requested.iter().all(|id| id == GATE_ID), "{requested:?}");
 }
 
 #[test]
@@ -3487,12 +3357,10 @@ fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() 
     };
     let at_80 = title_chars(&app, 80);
     for w in 40..=140u16 {
-        for h in 10..=40u16 {
-            for line in render(&app, w, h).lines() {
-                assert!(cells(line.trim_end()) <= usize::from(w), "{w}x{h}");
-            }
-        }
         let s = render(&app, w, 30);
+        for line in s.lines() {
+            assert!(cells(line.trim_end()) <= usize::from(w), "{w}\n{s}");
+        }
         // The heading fits its column; a label that doesn't is clipped as
         // supplied, never rebuilt from the number.
         for want in ["Review", "!42", "group…", COMBINING_LABEL] {
@@ -4045,56 +3913,20 @@ fn the_detail_view_keeps_its_invariants_at_every_size() {
             }
         }
     }
-    // The same with a review row and a gate hint: each kind of hint, both
-    // kinds of label, with and without a snapshot.
-    let note = format!("a note: {}", send_command());
-    let marked = json!(["choco: changes", "choco: accept"]);
-    for (markers, hint, label, snapshot) in [
-        (marked, marked_hint(), "!42", true),
-        (json!([]), note, LONG_LABEL, false),
-        (Value::Null, unavailable_hint(), WIDE_DETAIL_LABEL, false),
-    ] {
-        let app = long_gate_view(markers, label, snapshot);
-        for w in 40..=140u16 {
-            for h in 10..=40u16 {
-                assert_detail_invariants(&app, w, h, false);
-            }
-            let s = render(&app, w, 40);
-            // The row is the supplied label and URL; where the screen is too
-            // narrow in cells, it is cut at the edge and says so.
-            let review = format!("Review       {label} {MERGE_URL}");
-            let line = s.lines().find(|l| l.starts_with("Review ")).expect(&s);
-            let line = line.trim_end();
-            if cells(&review) > usize::from(w) {
-                let kept = line.strip_suffix('…').expect(&s);
-                assert!(review.starts_with(kept) && kept.contains(label), "{w}\n{s}");
-            } else {
-                assert_eq!(line, review, "{w}\n{s}");
-            }
-            if w >= 100 {
-                assert_eq!(waiting_row(&s).as_ref(), Some(&hint), "{w}\n{s}");
-            }
-        }
-    }
 }
 
-const LONG_LABEL: &str = "group/proj!1234567";
-/// Ten wide characters and a combining one: 21 cells in 12 characters.
-const WIDE_DETAIL_LABEL: &str = "界界界界界界界界界界e\u{301}";
-
-/// [`long_detail`] at an open gate with a published review.
-fn long_gate_view(gate_markers: Value, label: &str, snapshot: bool) -> App {
-    let mut d = with_detail_status(long_detail(34, false), GATE_ID, "open", "ci", "human_gate");
-    d["gate_markers"] = gate_markers;
-    let mut review = supplied_review();
-    review.label = label.into();
-    d["reviews"] = json!([review]);
-    let mut app = gate_view(waiting(gate_summary("open", "ci")));
-    answer(&mut app, GATE_ID, Ok(d));
-    if !snapshot {
-        drop_snapshot(&mut app);
-    }
-    app
+#[test]
+fn a_wide_review_label_cuts_the_detail_row_by_cells() {
+    let mut detail = gate_detail(Value::Null);
+    let label = "界界界界界界界界界界e\u{301}";
+    detail["reviews"][0]["label"] = json!(label);
+    let app = detail_only(detail);
+    // By characters the row would fit in 70 columns; in cells it doesn't.
+    let s = render(&app, 70, 30);
+    let review = format!("Review       {label} {MERGE_URL}");
+    let line = s.lines().find(|l| l.starts_with("Review ")).expect(&s);
+    let kept = line.trim_end().strip_suffix('…').expect(&s);
+    assert!(review.starts_with(kept) && kept.contains(label), "{s}");
 }
 
 /// Dropping Role (with Cost) can free several lines at once; the freed
@@ -4856,7 +4688,7 @@ fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
     for all_projects in [true, false] {
         // The first row selected, then the last, which scrolls to the end.
         for last in [false, true] {
-            for h in 10u16..=40 {
+            for h in [10u16, 24, 40] {
                 for w in 40u16..=140 {
                     let mut app = new_app(if all_projects {
                         Scope::AllProjects

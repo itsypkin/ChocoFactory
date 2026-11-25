@@ -806,8 +806,8 @@ is gone and the header names the project. In a parallel group the stage column r
 example `review_panel 2/3`. Narrow terminals drop columns: below
 91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
 80 the laps and `Review` columns, below 60 the stage and project columns too.
-The `Review` column shows the publisher's label, cut with `…` when it is longer
-than six characters; the search popup does the same.
+The `Review` column shows the publisher's label, cut with `…` when it is wider
+than six terminal cells; the search popup does the same.
 Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
 
 | Key | Action |
@@ -833,15 +833,12 @@ In the status view, an `open` task waiting at a human gate has a `Waiting for`
 row. It always gives the command, with the task's id:
 `choco task send <id> --text "…"`. Before it, the row says one of:
 
-- the gate's marker lines, to use on a line of their own, joined with ` or `.
-  The daemon accepts a marker only exactly, so a character the screen can't show
-  as itself is written `\u{…}`, with its hex code: every space in a run of two
-  or more, a tab or any other whitespace, a control character, common invisible
-  characters such as a zero-width space, and a backslash. Other single spaces
-  are spaces. When a marker has such a code, the row says so: type the one
-  character instead of the code (`20` is a space, `9` a tab). To get a tab into
-  `--text` from bash or zsh, quote the whole text as `$'…\t…'`. `gate_markers`
-  has the lines as they are;
+- the gate's marker lines, to use on a line of their own, each between
+  backticks and joined with ` or `. A line is shown as it is configured, with
+  no spaces collapsed. Invisible and control characters show however the
+  terminal draws them, which may be not at all (a tab, for one), and a marker
+  that itself contains ` or ` or a backtick can be hard to tell apart.
+  `gate_markers` has the lines exactly;
 - `a note`, for a gate without markers (a reply made up only of another gate's
   marker lines is still [refused](workflows.md#a-human-gate-that-watches-for-its-answer));
 - `marker instructions unavailable, so a reply may be refused`, when the lines
@@ -851,10 +848,13 @@ row. It always gives the command, with the task's id:
   loads).
 
 A task that isn't at a gate, or is `pausing`, `paused`, `stuck`, `closed` or
-`cancelled`, has no such row. The lines come from the workflow, as `gate_markers`
-does: they don't mean that a comment on a forge is read, and the daemon decides
-whether a reply is accepted. On a short or narrow screen the row is cut or left
-out, so what is shown may not be all of it.
+`cancelled`, has no such row. Once the task's details have loaded, the view's
+`Status` row shows their status, and any status but `open` there removes the
+`Waiting for` row, even when the list's latest refresh still says `open`. The
+lines come from the workflow, as `gate_markers` does: they don't mean that a
+comment on a forge is read, and the daemon decides whether a reply is accepted.
+On a short or narrow screen the row is cut or left out, so what is shown may not
+be all of it.
 
 `/` opens a search popup over the current view. It searches every task in the
 dashboard's scope (all statuses, including closed and cancelled tasks beyond

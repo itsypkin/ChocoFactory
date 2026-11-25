@@ -133,17 +133,22 @@ fn chunk_cells(s: &str, w: usize) -> Vec<String> {
     chunks
 }
 
-/// Cuts `s` to `w` cells, ending in `…` when something was dropped.
+/// `s` made printable and cut to `w` cells, ending in `…` when something was
+/// dropped.
 pub fn fit(s: &str, w: usize) -> String {
-    let s = printable(s);
-    if cell_len(&s) <= w {
-        return s;
+    clip(&printable(s), w)
+}
+
+/// [`fit`] without rewriting any of `s`.
+fn clip(s: &str, w: usize) -> String {
+    if cell_len(s) <= w {
+        return s.to_string();
     }
     if w == 0 {
         return String::new();
     }
     let mut used = 0;
-    let span = Span::raw(s.as_str());
+    let span = Span::raw(s);
     let mut out: String = span
         .styled_graphemes(Style::default())
         .map_while(|g| {
@@ -777,6 +782,9 @@ struct FRow {
     value: String,
     error: bool,
     wrap: bool,
+    /// The value holds text to show as written (a gate's marker lines): a
+    /// wrapped row breaks it only at a lone space and rewrites nothing.
+    verbatim: bool,
     /// Most screen lines a wrapped row may take (cut with `…` beyond).
     cap: usize,
     /// Which cut drops this row when the screen is short (1 = first to go).
@@ -790,94 +798,55 @@ impl FRow {
             value,
             error: false,
             wrap: false,
+            verbatim: false,
             cap: WRAP_MAX,
             drop: 0,
         }
     }
 }
 
-/// Characters that put nothing on screen that a reader could tell apart.
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-    )
-}
-
-/// A marker line as the hint shows it. The daemon accepts a marker only
-/// exactly, so none of it may be collapsed or left to guess. A space is shown
-/// as itself only between two characters that are not spaces. Any other space,
-/// other whitespace, control and invisible characters are written `\u{hex}`.
-/// A backslash is written that way too, so every backslash shown starts one.
-/// The result has no run of spaces, so word wrapping leaves it as it is.
-pub(super) fn shown_marker(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        let before = i.checked_sub(1).map(|p| chars[p]);
-        let escape = match c {
-            ' ' => [before, chars.get(i + 1).copied()]
-                .iter()
-                .any(|next| next.is_none_or(|n| n == ' ')),
-            '\\' => true,
-            _ => c.is_whitespace() || c.is_control() || is_invisible(c),
-        };
-        if escape {
-            out.extend(c.escape_unicode());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The hint for a gate with these marker lines, before the send command.
+/// The hint for a gate with these marker lines, before the send command: each
+/// line exactly as configured, between backticks. The daemon accepts a marker
+/// only exactly, so the row is `verbatim`.
 fn marker_hint(lines: &[&str]) -> String {
-    let shown: Vec<String> = lines.iter().map(|l| shown_marker(l)).collect();
-    // Said only when something is written as a code: typed as shown, such a
-    // marker would be refused.
-    let codes = if shown.iter().zip(lines).any(|(s, l)| s != l) {
-        "; for each \\u{…} type the one character with that hex code, 20 = space, 9 = tab"
-    } else {
-        ""
-    };
-    format!("a marker on its own line ({}{codes})", shown.join(" or "))
+    let shown: Vec<String> = lines.iter().map(|l| format!("`{l}`")).collect();
+    format!("a marker on its own line ({})", shown.join(" or "))
 }
 
 /// The `Waiting for` row's value: how to reply to the open human gate the
 /// task is at; `None` when it is at none.
 ///
-/// The status, stage and "waiting" facts come from the snapshot when there
-/// is one, else from the loaded detail. The marker lines come only from the
-/// detail's `gate_markers`, and only while it is at the same stage; anything
-/// else that isn't a list of strings (not loaded yet, `null`, missing, the
-/// wrong type) reads as unavailable, never as a gate without markers.
+/// The status comes from the loaded detail when there is one, since the list's
+/// snapshot can be older; else from the snapshot. The stage and "waiting"
+/// facts come from the snapshot when there is one, else from the loaded
+/// detail. The marker lines come only from the detail's `gate_markers`, and
+/// only while it is at the same stage; anything else that isn't a list of
+/// strings (not loaded yet, `null`, missing, the wrong type) reads as
+/// unavailable, never as a gate without markers.
 fn waiting_text(d: &Detail) -> Option<String> {
     let data = d.data.as_ref();
     let state = data.and_then(|v| v.get("workflow_state"));
     let text = |v: Option<&'_ serde_json::Value>, key: &str| -> Option<String> {
         v?.get(key)?.as_str().map(str::to_string)
     };
-    let detail_stage = text(state, "current_stage");
-    let (status, at_gate, same_stage) = match &d.snapshot {
-        Some(t) => (
-            t.task.status.clone(),
-            t.waiting_on_human,
-            detail_stage.is_some() && detail_stage == t.current_stage,
-        ),
-        None => (
-            text(data, "status")?,
-            text(state, "stage_kind").as_deref() == Some("human_gate"),
-            true,
-        ),
+    let status = match data {
+        Some(_) => text(data, "status")?,
+        None => d.snapshot.as_ref()?.task.status.clone(),
     };
     if status != TASK_STATUS_OPEN {
         return None;
     }
+    let detail_stage = text(state, "current_stage");
+    let (at_gate, same_stage) = match &d.snapshot {
+        Some(t) => (
+            t.waiting_on_human,
+            detail_stage.is_some() && detail_stage == t.current_stage,
+        ),
+        None => (
+            text(state, "stage_kind").as_deref() == Some("human_gate"),
+            true,
+        ),
+    };
     if !at_gate {
         return None;
     }
@@ -920,11 +889,6 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                     paths += 1;
                     if label == LABEL_WORKFLOW_FILE || paths == 2 {
                         row.drop = 4;
-                    }
-                }
-                LABEL_STATUS => {
-                    if let Some(t) = snap {
-                        row.value = t.task.status.clone();
                     }
                 }
                 // The snapshot is fresher: rebuilt after Status below.
@@ -1028,6 +992,7 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
     if let Some(text) = waiting_text(d) {
         let mut row = FRow::new("Waiting for", text);
         row.wrap = true;
+        row.verbatim = true;
         extra.push(row);
     }
     let at = (at + 1).min(rows.len());
@@ -1094,11 +1059,17 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
         return vec![fit(format!("{head}{}", row.value).trim_end(), width)];
     }
     let room = width.saturating_sub(label_w + 2).max(1);
-    let mut parts = wrap_words(&crate::render::single_line(&row.value), room);
+    let mut parts = if row.verbatim {
+        wrap_tokens(lone_space_words(&row.value), room)
+    } else {
+        wrap_words(&crate::render::single_line(&row.value), room)
+    };
+    // `clip`, not `fit`: the wrapped parts are final. Prose has been made
+    // printable already, and verbatim text must stay as it is.
     if parts.len() > row.cap {
         parts.truncate(row.cap);
         let last = parts.last_mut().expect("wrap keeps a line");
-        *last = fit(&format!("{last}…"), room);
+        *last = clip(&format!("{last}…"), room);
     }
     let pad = " ".repeat(label_w + 2);
     parts
@@ -1106,9 +1077,9 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
         .enumerate()
         .map(|(i, p)| {
             if i == 0 {
-                fit(&format!("{head}{p}"), width)
+                clip(&format!("{head}{p}"), width)
             } else {
-                fit(&format!("{pad}{p}"), width)
+                clip(&format!("{pad}{p}"), width)
             }
         })
         .collect()
@@ -1612,11 +1583,33 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
 /// and is split into `w`-cell chunks, the last of which later words may join.
 /// Empty input is one empty line.
 fn wrap_words(s: &str, w: usize) -> Vec<String> {
+    // Measured as it will be shown, control characters as spaces.
+    wrap_tokens(printable(s).split_whitespace(), w)
+}
+
+/// `s` cut only at lone spaces, those with no whitespace beside them. Every
+/// other space, tab or other whitespace stays in its word, so wrapping these
+/// words can't collapse or rewrite any of it.
+fn lone_space_words(s: &str) -> Vec<&str> {
+    let blank = |c: Option<char>| c.is_some_and(char::is_whitespace);
+    let mut words = Vec::new();
+    let mut start = 0;
+    for (i, _) in s.match_indices(' ') {
+        if !blank(s[..i].chars().next_back()) && !blank(s[i + 1..].chars().next()) {
+            words.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    words.push(&s[start..]);
+    words
+}
+
+/// [`wrap_words`] for words already split: each is kept as it is.
+fn wrap_tokens<'a>(words: impl IntoIterator<Item = &'a str>, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
-    // Measured as `fit` will show it, control characters as spaces.
-    for word in printable(s).split_whitespace() {
+    for word in words {
         let n = cell_len(word);
         if n > w {
             if !cur.is_empty() {
@@ -1662,7 +1655,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::wrap_words;
+    use super::{lone_space_words, wrap_words};
+
+    #[test]
+    fn only_a_space_with_no_whitespace_beside_it_ends_a_word() {
+        assert_eq!(
+            lone_space_words("a b  c \td \u{a0}e f\tg"),
+            ["a", "b  c \td \u{a0}e", "f\tg"]
+        );
+    }
 
     #[test]
     fn empty_input_is_one_empty_line() {
