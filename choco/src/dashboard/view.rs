@@ -1655,7 +1655,16 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::{lone_space_words, wrap_words};
+    use super::{FRow, lone_space_words, row_lines, wrap_words};
+
+    #[test]
+    fn a_verbatim_row_cut_at_its_last_line_is_not_made_printable() {
+        let mut row = FRow::new("W", "a\tb c d".to_string());
+        row.wrap = true;
+        row.verbatim = true;
+        row.cap = 1;
+        assert_eq!(row_lines(&row, 1, 8), ["W  a\tb c…"]);
+    }
 
     #[test]
     fn only_a_space_with_no_whitespace_beside_it_ends_a_word() {
