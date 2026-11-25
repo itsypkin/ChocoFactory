@@ -4,10 +4,11 @@
 //! this repo ships no terminal-styling dependency.
 
 use chocofactory_core::models::{
-    Event, EventType, PauseOutcome, Project, QueuedTurn, ResumeOutcome, RetryOutcome, Task,
-    TaskSummary,
+    Event, EventType, PauseOutcome, Project, QueuedTurn, ResumeOutcome, RetryOutcome, ReviewRef,
+    Task, TaskSummary,
 };
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::client::EventsPage;
@@ -498,8 +499,23 @@ pub const LABEL_REPO: &str = "Repo";
 pub const LABEL_ROLE: &str = "Role";
 pub const LABEL_CREATED: &str = "Created";
 pub const LABEL_STAGE: &str = "Stage";
+/// The task's published review; absent when it has none.
+pub const LABEL_REVIEW: &str = "Review";
 /// One row per turn waiting for a slot; absent when nothing waits.
 pub const LABEL_QUEUED: &str = "Queued";
+
+/// The value of a `Review` row: the label and URL exactly as the publisher
+/// supplied them.
+pub fn review_value(review: &ReviewRef) -> String {
+    format!("{} {}", review.label, review.url)
+}
+
+/// The review `GET /tasks/{id}` reports. `None` when `reviews` is empty,
+/// missing or not shaped as a review: nothing else in the answer is read in
+/// its place.
+pub fn detail_review(detail: &Value) -> Option<ReviewRef> {
+    ReviewRef::deserialize(detail.get("reviews")?.get(0)?).ok()
+}
 
 /// The field rows `choco task status` prints for the daemon's `TaskDetail`
 /// JSON, as `(label, value)` pairs: the order and wording are the CLI's, and
@@ -605,6 +621,9 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
 
     if let Some(current) = detail_stage(detail) {
         pairs.push((LABEL_STAGE, current.to_string()));
+    }
+    if let Some(review) = detail_review(detail) {
+        pairs.push((LABEL_REVIEW, review_value(&review)));
     }
     if let Some(queued) = detail.get("queued").and_then(Value::as_array) {
         for turn in queued {
@@ -2710,6 +2729,38 @@ mod tests {
         assert!(task_fields(&detail).iter().all(|(l, _)| *l != LABEL_CLOSES));
         detail.as_object_mut().unwrap().remove("closes");
         assert!(task_fields(&detail).iter().all(|(l, _)| *l != LABEL_CLOSES));
+    }
+
+    /// One `Review` row, the supplied label and URL, after Stage and before
+    /// the queued rows; none without a normalized review.
+    #[test]
+    fn task_fields_have_one_review_row_from_the_normalized_review_alone() {
+        let url = "https://review.example/team/repo/-/merge_requests/42";
+        let mut detail = json!({
+            "id": "t1", "title": "x", "status": "open",
+            "workflow_state": {
+                "current_stage": "accept_change",
+                "payload": {"stages": {"open_pr": {"number": 99, "url": "https://x/pull/99"}}}
+            },
+            "reviews": [{"stage": "publish_change", "number": 42, "url": url, "label": "!42"}],
+            "queued": [{"stage": "accept_change", "position": 1, "waiting_ms": 0}],
+        });
+        let reviews = |detail: &Value| -> Vec<String> {
+            let rows = task_fields(detail).into_iter();
+            rows.filter(|(l, _)| *l == LABEL_REVIEW)
+                .map(|(_, v)| v)
+                .collect()
+        };
+        assert_eq!(reviews(&detail), [format!("!42 {url}")]);
+        let labels: Vec<&str> = task_fields(&detail).iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels[labels.len() - 3..],
+            [LABEL_STAGE, LABEL_REVIEW, LABEL_QUEUED]
+        );
+        assert!(task_detail(&detail, test_now()).contains(&format!("!42 {url}")));
+        detail["reviews"] = json!([]);
+        assert!(reviews(&detail).is_empty());
+        assert!(!task_detail(&detail, test_now()).contains("/pull/99"));
     }
 
     #[test]

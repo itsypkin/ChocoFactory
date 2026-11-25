@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chocofactoryd::template::render;
-use chocofactoryd::workflow_def::{Capture, StageKind, WorkflowDefinition};
+use chocofactoryd::workflow_def::{Capture, ShellCommand, StageKind, WorkflowDefinition};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -164,6 +164,45 @@ fn review_panel_has_the_decided_shape() {
     assert_eq!(
         (g.on.as_str(), g.max, g.then.as_str()),
         ("changes_requested", 3, "escalate_to_human")
+    );
+
+    // The panel publishes its review the way the shipped workflows do, from
+    // the lead's verdict and report.
+    let publisher = &def.stages["open_pr"];
+    let StageKind::Shell {
+        command,
+        env,
+        capture,
+        timeout,
+        publishes_review,
+    } = &publisher.kind
+    else {
+        panic!("open_pr must run a command");
+    };
+    assert!(*publishes_review, "open_pr must publish the review");
+    assert_eq!(*capture, Some(Capture::Json));
+    assert_eq!(*timeout, Some(std::time::Duration::from_secs(300)));
+    assert_eq!(
+        *command,
+        ShellCommand::ScriptFile(exp().join("scripts/open-pr.sh"))
+    );
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        env,
+        [
+            ("PR_TASK_TITLE", "{{ task.title }}"),
+            ("PR_DESCRIPTION", "{{ stages.describe_pr.summary }}"),
+            ("PR_REVIEW_VERDICT", "{{ stages.lead_review.outcome }}"),
+            ("PR_REVIEW_REPORT", "{{ stages.lead_review.summary }}"),
+        ]
+    );
+    let on: Vec<_> = publisher.on.iter().collect();
+    assert_eq!(
+        on,
+        [
+            (&"done".to_string(), &"checks_polling".to_string()),
+            (&"error".to_string(), &"escalate_to_human".to_string())
+        ]
     );
 
     // A PR that starts conflicting is rebased, bounded by its own guard (#342).

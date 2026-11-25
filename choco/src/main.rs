@@ -708,7 +708,12 @@ mod tests {
             ]
         };
         assert_eq!(ids(&search_rows(rows(), "#289")), ["aaaa1111"]);
+        assert_eq!(ids(&search_rows(rows(), "!289")), ["aaaa1111"]);
         assert_eq!(ids(&search_rows(rows(), "289")), ["aaaa1111", "289f0000"]);
+        // The CLI keeps the order it was given, unlike the popup.
+        let mixed = crate::dashboard::search::tests::mixed;
+        assert_eq!(ids(&search_rows(mixed(), "42")), ["aaaa1111", "42ab0000"]);
+        assert_eq!(ids(&search_rows(mixed(), "!42")), ["aaaa1111"]);
         assert_eq!(ids(&search_rows(rows(), "CLOSES")), ["dddd4444"]);
     }
 

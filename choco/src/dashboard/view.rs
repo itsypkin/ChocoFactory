@@ -2,17 +2,18 @@
 //! thing it writes back is the visible list height and scroll offset, which
 //! `update` needs for paging.
 
-use chocofactory_core::models::TaskSummary;
+use chocofactory_core::models::{TASK_STATUS_OPEN, TaskSummary};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::{
     LABEL_BASE, LABEL_CLOSES, LABEL_CREATED, LABEL_ID, LABEL_PAUSED, LABEL_PROJECT, LABEL_REPO,
-    LABEL_ROLE, LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW,
+    LABEL_REVIEW, LABEL_ROLE, LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW,
     LABEL_WORKFLOW_FILE,
 };
 
@@ -85,26 +86,83 @@ fn error_style(app: &App) -> Style {
 
 // ---- text helpers -------------------------------------------------------
 
-/// Cuts `s` to `w` characters, ending in `…` when something was dropped.
-pub fn fit(s: &str, w: usize) -> String {
-    let s: String = s
-        .chars()
+/// `s` with each control character as the space it is shown as.
+fn printable(s: &str) -> String {
+    s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if s.chars().count() <= w {
-        return s;
+        .collect()
+}
+
+/// The terminal cells one grapheme takes, as ratatui draws it.
+fn grapheme_cells(grapheme: &str) -> usize {
+    usize::from(grapheme.cell_width())
+}
+
+/// The terminal cells `s` takes: not its character count, since a wide
+/// character takes two and a combining mark none.
+fn cell_len(s: &str) -> usize {
+    // One cell each, without the cost of splitting into graphemes: this runs
+    // for every field of every frame.
+    if s.is_ascii() {
+        return s.len();
+    }
+    Span::raw(s)
+        .styled_graphemes(Style::default())
+        .map(|g| grapheme_cells(g.symbol))
+        .sum()
+}
+
+/// `s` in pieces of at most `w` cells, cut between graphemes. A grapheme
+/// wider than `w` is a piece of its own.
+fn chunk_cells(s: &str, w: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0;
+    for g in Span::raw(s).styled_graphemes(Style::default()) {
+        let n = grapheme_cells(g.symbol);
+        if used + n > w && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        cur.push_str(g.symbol);
+        used += n;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// `s` made printable and cut to `w` cells, ending in `…` when something was
+/// dropped.
+pub fn fit(s: &str, w: usize) -> String {
+    clip(&printable(s), w)
+}
+
+/// [`fit`] without rewriting any of `s`.
+fn clip(s: &str, w: usize) -> String {
+    if cell_len(s) <= w {
+        return s.to_string();
     }
     if w == 0 {
         return String::new();
     }
-    let mut out: String = s.chars().take(w - 1).collect();
+    let mut used = 0;
+    let span = Span::raw(s);
+    let mut out: String = span
+        .styled_graphemes(Style::default())
+        .map_while(|g| {
+            used += grapheme_cells(g.symbol);
+            (used < w).then_some(g.symbol)
+        })
+        .collect();
     out.push('…');
     out
 }
 
 fn pad(s: &str, w: usize) -> String {
     let mut out = fit(s, w);
-    let n = out.chars().count();
+    let n = cell_len(&out);
     out.extend(std::iter::repeat_n(' ', w.saturating_sub(n)));
     out
 }
@@ -135,7 +193,7 @@ fn first_line(s: &str) -> &str {
 struct Cols {
     project: bool,
     stage: bool,
-    pr: bool,
+    review: bool,
     laps: bool,
     cost: bool,
 }
@@ -144,7 +202,7 @@ fn cols_for(app: &App, width: u16) -> Cols {
     Cols {
         project: app.all_projects() && width >= 60,
         stage: width >= 60,
-        pr: width >= 80,
+        review: width >= 80,
         laps: width >= 80,
         // 80 plus the column and its separator, so the title never has less
         // room than it has at 80.
@@ -159,7 +217,7 @@ enum Key {
     Title,
     Stage,
     Reason,
-    Pr,
+    Review,
     Time,
     Laps,
     Status,
@@ -182,7 +240,7 @@ struct Grid {
 }
 
 const ID_W: usize = 8;
-const PR_W: usize = 6;
+const REVIEW_W: usize = 6;
 const TIME_W: usize = 10;
 const LAPS_W: usize = 5;
 const COST_W: usize = 9;
@@ -195,7 +253,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
         sections
             .iter()
             .flatten()
-            .map(|t| app.project_label(&t.task.project_id).chars().count())
+            .map(|t| cell_len(&app.project_label(&t.task.project_id)))
             .max()
             .unwrap_or(7)
             .clamp(7, 14)
@@ -209,7 +267,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
             .flat_map(|(ts, s)| ts.iter().map(move |t| (s, t)))
             .filter_map(|(s, t)| match s {
                 Section::NeedsYou | Section::InProgress | Section::Paused => {
-                    Some(stage_cell(t).chars().count())
+                    Some(cell_len(&stage_cell(t)))
                 }
                 Section::Closed => Some(t.task.status.chars().count()),
                 Section::Stuck => None,
@@ -230,7 +288,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
         0
     };
     let mut fixed_cols = vec![ID_W, TIME_W];
-    fixed_cols.extend([PR_W].into_iter().filter(|_| cols.pr));
+    fixed_cols.extend([REVIEW_W].into_iter().filter(|_| cols.review));
     fixed_cols.extend([LAPS_W].into_iter().filter(|_| cols.laps));
     fixed_cols.extend([COST_W].into_iter().filter(|_| cols.cost));
     let n = fixed_cols.len() + 1 + usize::from(cols.project) + usize::from(cols.stage);
@@ -257,7 +315,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
             .map(|t| {
                 // A waiting turn's `· queued N` is the point of its cell.
                 let most = if t.queued.is_empty() { 22 } else { 30 };
-                stage_cell(t).chars().count().clamp(6, most)
+                cell_len(&stage_cell(t)).clamp(6, most)
             })
             .max()
             .unwrap_or(0)
@@ -274,9 +332,9 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid 
     }
 }
 
-/// The columns of one section's rows. The id, project, title, PR, time and
-/// laps columns sit at the same place in every section; a stuck task's
-/// reason takes the stage and PR columns' room.
+/// The columns of one section's rows. The id, project, title, review, time
+/// and laps columns sit at the same place in every section; a stuck task's
+/// reason takes the stage and review columns' room.
 fn columns(section: Section, g: &Grid) -> Vec<Col> {
     let c = |key, w| Col { key, w };
     let mut v = vec![c(Key::Id, ID_W)];
@@ -285,7 +343,7 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     }
     let mut title_w = g.title_w;
     let mut mid = None;
-    let mut pr = g.cols.pr;
+    let mut review = g.cols.review;
     match section {
         Section::NeedsYou | Section::InProgress | Section::Paused => {
             if g.cols.stage {
@@ -299,9 +357,9 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
         }
         Section::Stuck => {
             if g.cols.stage {
-                let w = g.stage_w + if pr { 2 + PR_W } else { 0 };
+                let w = g.stage_w + if review { 2 + REVIEW_W } else { 0 };
                 mid = Some(c(Key::Reason, w));
-                pr = false;
+                review = false;
             } else {
                 // Narrow: no stage column to borrow, so share the title's room.
                 let reason = (title_w.saturating_sub(2) / 2).min(24);
@@ -312,8 +370,8 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     }
     v.push(c(Key::Title, title_w));
     v.extend(mid);
-    if pr {
-        v.push(c(Key::Pr, PR_W));
+    if review {
+        v.push(c(Key::Review, REVIEW_W));
     }
     v.push(c(Key::Time, TIME_W));
     if g.cols.laps {
@@ -364,10 +422,10 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
         Key::Title => t.task.title.clone(),
         Key::Stage => stage_cell(t),
         Key::Reason => first_line(t.task.stuck_reason.as_deref().unwrap_or("")).to_string(),
-        Key::Pr => t
+        Key::Review => t
             .reviews
             .first()
-            .map(|r| format!("#{}", r.number))
+            .map(|r| r.label.clone())
             .unwrap_or_default(),
         Key::Time => match section {
             Section::NeedsYou | Section::InProgress => age(app, t.stage_entered_at),
@@ -431,7 +489,7 @@ fn heading_line(g: &Grid) -> String {
             Key::Project => "project",
             Key::Title => "title",
             Key::Stage => "stage",
-            Key::Pr => "PR",
+            Key::Review => LABEL_REVIEW,
             Key::Laps => "laps",
             Key::Cost => "cost",
             _ => "",
@@ -558,7 +616,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  s send  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o review  r retry  p pause  s send  c cancel  ? help  q quit",
     );
 }
 
@@ -724,6 +782,9 @@ struct FRow {
     value: String,
     error: bool,
     wrap: bool,
+    /// The value holds text to show as written (a gate's marker lines): a
+    /// wrapped row breaks it only at a lone space and rewrites nothing.
+    verbatim: bool,
     /// Most screen lines a wrapped row may take (cut with `…` beyond).
     cap: usize,
     /// Which cut drops this row when the screen is short (1 = first to go).
@@ -737,26 +798,71 @@ impl FRow {
             value,
             error: false,
             wrap: false,
+            verbatim: false,
             cap: WRAP_MAX,
             drop: 0,
         }
     }
 }
 
-fn waiting_text(stage: &str, id: &str) -> Option<String> {
-    match stage {
-        "awaiting_human_review" => Some(
-            "your verdict: a PR comment with /approve or /request-changes on its own line"
-                .to_string(),
-        ),
-        "escalate_to_human" => Some(format!(
-            "a note to resume it: choco task send {id} --text \"…\""
-        )),
-        "spec_questions" => Some(format!(
-            "your answers to the spec check's questions: choco task send {id} --text \"…\""
-        )),
-        _ => None,
+/// The hint for a gate with these marker lines, before the send command: each
+/// line exactly as configured, between backticks. The daemon accepts a marker
+/// only exactly, so the row is `verbatim`.
+fn marker_hint(lines: &[&str]) -> String {
+    let shown: Vec<String> = lines.iter().map(|l| format!("`{l}`")).collect();
+    format!("a marker on its own line ({})", shown.join(" or "))
+}
+
+/// The `Waiting for` row's value: how to reply to the open human gate the
+/// task is at; `None` when it is at none.
+///
+/// The status comes from the loaded detail when there is one, since the list's
+/// snapshot can be older; else from the snapshot. The stage and "waiting"
+/// facts come from the snapshot when there is one, else from the loaded
+/// detail. The marker lines come only from the detail's `gate_markers`, and
+/// only while it is at the same stage; anything else that isn't a list of
+/// strings (not loaded yet, `null`, missing, the wrong type) reads as
+/// unavailable, never as a gate without markers.
+fn waiting_text(d: &Detail) -> Option<String> {
+    let data = d.data.as_ref();
+    let state = data.and_then(|v| v.get("workflow_state"));
+    let text = |v: Option<&'_ serde_json::Value>, key: &str| -> Option<String> {
+        v?.get(key)?.as_str().map(str::to_string)
+    };
+    let status = match data {
+        Some(_) => text(data, "status")?,
+        None => d.snapshot.as_ref()?.task.status.clone(),
+    };
+    if status != TASK_STATUS_OPEN {
+        return None;
     }
+    let detail_stage = text(state, "current_stage");
+    let (at_gate, same_stage) = match &d.snapshot {
+        Some(t) => (
+            t.waiting_on_human,
+            detail_stage.is_some() && detail_stage == t.current_stage,
+        ),
+        None => (
+            text(state, "stage_kind").as_deref() == Some("human_gate"),
+            true,
+        ),
+    };
+    if !at_gate {
+        return None;
+    }
+    let markers: Option<Vec<&str>> = data
+        .filter(|_| same_stage)
+        .and_then(|v| v.get("gate_markers"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|lines| lines.iter().map(serde_json::Value::as_str).collect());
+    let send = format!("choco task send {} --text \"…\"", d.id);
+    Some(match markers {
+        None => {
+            format!("marker instructions unavailable, so a reply may be refused. Reply with {send}")
+        }
+        Some(lines) if lines.is_empty() => format!("a note: {send}"),
+        Some(lines) => format!("{}: {send}", marker_hint(&lines)),
+    })
 }
 
 /// The rows of the fields block: `choco task status`'s rows from the last
@@ -783,11 +889,6 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                     paths += 1;
                     if label == LABEL_WORKFLOW_FILE || paths == 2 {
                         row.drop = 4;
-                    }
-                }
-                LABEL_STATUS => {
-                    if let Some(t) = snap {
-                        row.value = t.task.status.clone();
                     }
                 }
                 // The snapshot is fresher: rebuilt after Status below.
@@ -834,8 +935,13 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         rows.insert(pos + 1, FRow::new(LABEL_PAUSED, value));
     }
 
-    // Stage, with the time in it (or how long ago it ended), then PR and
-    // what the task waits for.
+    // Stage, with the time in it (or how long ago it ended), then the review
+    // and what the task waits for. The review row is taken out so it can go
+    // back right after Stage wherever Stage ends up.
+    let review_row = rows
+        .iter()
+        .position(|r| r.label == LABEL_REVIEW)
+        .map(|pos| rows.remove(pos));
     let stage_name = snap
         .and_then(|t| t.current_stage.as_deref())
         .or_else(|| d.data.as_ref().and_then(crate::render::detail_stage));
@@ -874,22 +980,20 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         }
     };
     let mut extra = Vec::new();
-    if let Some(t) = snap {
-        if let Some(review) = t.reviews.first() {
-            extra.push(FRow::new(
-                "PR",
-                format!("#{} {}", review.number, review.url),
-            ));
-        }
-        if t.task.status == "open"
-            && let Some(stage) = t.current_stage.as_deref()
-            && t.waiting_on_human
-            && let Some(text) = waiting_text(stage, &t.task.id)
-        {
-            let mut row = FRow::new("Waiting for", text);
-            row.wrap = true;
-            extra.push(row);
-        }
+    // Once the detail has loaded, `task_fields` alone decides whether there
+    // is a review row; the snapshot only stands in until then.
+    extra.extend(match (&d.data, snap) {
+        (None, Some(t)) => t
+            .reviews
+            .first()
+            .map(|review| FRow::new(LABEL_REVIEW, crate::render::review_value(review))),
+        _ => review_row,
+    });
+    if let Some(text) = waiting_text(d) {
+        let mut row = FRow::new("Waiting for", text);
+        row.wrap = true;
+        row.verbatim = true;
+        extra.push(row);
     }
     let at = (at + 1).min(rows.len());
     let after = at + extra.len();
@@ -955,11 +1059,17 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
         return vec![fit(format!("{head}{}", row.value).trim_end(), width)];
     }
     let room = width.saturating_sub(label_w + 2).max(1);
-    let mut parts = wrap_words(&crate::render::single_line(&row.value), room);
+    let mut parts = if row.verbatim {
+        wrap_tokens(lone_space_words(&row.value), room)
+    } else {
+        wrap_words(&crate::render::single_line(&row.value), room)
+    };
+    // `clip`, not `fit`: the wrapped parts are final. Prose has been made
+    // printable already, and verbatim text must stay as it is.
     if parts.len() > row.cap {
         parts.truncate(row.cap);
         let last = parts.last_mut().expect("wrap keeps a line");
-        *last = fit(&format!("{last}…"), room);
+        *last = clip(&format!("{last}…"), room);
     }
     let pad = " ".repeat(label_w + 2);
     parts
@@ -967,9 +1077,9 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
         .enumerate()
         .map(|(i, p)| {
             if i == 0 {
-                fit(&format!("{head}{p}"), width)
+                clip(&format!("{head}{p}"), width)
             } else {
-                fit(&format!("{pad}{p}"), width)
+                clip(&format!("{pad}{p}"), width)
             }
         })
         .collect()
@@ -1289,9 +1399,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     draw_detail_body(frame, app, lines, area, STATUS_HINTS);
 }
 
-const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  s send  c cancel  Esc back";
+const STATUS_HINTS: &str = "e events  o review  r retry  p pause  s send  c cancel  Esc back";
 const EXPANDED_HINTS: &str =
-    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel";
+    "PgUp/PgDn scroll  End follow  e/Esc status  o review  r retry  p pause  s send  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1422,14 +1532,14 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     };
     let proj_w = loaded
         .iter()
-        .map(|t| app.project_label(&t.task.project_id).chars().count())
+        .map(|t| cell_len(&app.project_label(&t.task.project_id)))
         .max()
         .unwrap_or(0)
         .clamp(7, 14);
     let fixed = ID_W
         + if cols.project { proj_w + 2 } else { 0 }
         + if cols.stage { 9 + 2 } else { 0 }
-        + if cols.pr { PR_W + 2 } else { 0 }
+        + if cols.review { REVIEW_W + 2 } else { 0 }
         + 2;
     let title_w = inner.saturating_sub(2 + fixed).max(1);
     for (i, t) in results.iter().enumerate().skip(off).take(rows_h) {
@@ -1441,12 +1551,9 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
         if cols.stage {
             parts.push(pad(&t.task.status, 9));
         }
-        if cols.pr {
-            let pr = t
-                .reviews
-                .first()
-                .map_or("-".to_string(), |r| format!("#{}", r.number));
-            parts.push(pad(&pr, PR_W));
+        if cols.review {
+            let label = t.reviews.first().map_or("-", |r| r.label.as_str());
+            parts.push(pad(label, REVIEW_W));
         }
         let selected = Some(i) == sel;
         let text = format!("{}{}", if selected { "▶ " } else { "  " }, parts.join("  "));
@@ -1472,27 +1579,48 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     }
 }
 
-/// Word wrap. A token longer than a line ends the current line and is split
-/// into `w`-character chunks, the last of which later words may join. Empty
-/// input is one empty line.
+/// Word wrap to `w` cells. A token longer than a line ends the current line
+/// and is split into `w`-cell chunks, the last of which later words may join.
+/// Empty input is one empty line.
 fn wrap_words(s: &str, w: usize) -> Vec<String> {
+    // Measured as it will be shown, control characters as spaces.
+    wrap_tokens(printable(s).split_whitespace(), w)
+}
+
+/// `s` cut only at lone spaces, those with no whitespace beside them. Every
+/// other space, tab or other whitespace stays in its word, so wrapping these
+/// words can't collapse or rewrite any of it.
+fn lone_space_words(s: &str) -> Vec<&str> {
+    let blank = |c: Option<char>| c.is_some_and(char::is_whitespace);
+    let mut words = Vec::new();
+    let mut start = 0;
+    for (i, _) in s.match_indices(' ') {
+        if !blank(s[..i].chars().next_back()) && !blank(s[i + 1..].chars().next()) {
+            words.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    words.push(&s[start..]);
+    words
+}
+
+/// [`wrap_words`] for words already split: each is kept as it is.
+fn wrap_tokens<'a>(words: impl IntoIterator<Item = &'a str>, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
-    for word in s.split_whitespace() {
-        let n = word.chars().count();
+    for word in words {
+        let n = cell_len(word);
         if n > w {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
             }
-            let chars: Vec<char> = word.chars().collect();
-            let mut chunks = chars.chunks(w).map(|c| c.iter().collect::<String>());
-            let last = chunks.next_back().unwrap_or_default();
+            let mut chunks = chunk_cells(word, w);
+            cur = chunks.pop().unwrap_or_default();
             lines.extend(chunks);
-            cur = last;
             continue;
         }
-        if !cur.is_empty() && cur.chars().count() + 1 + n > w {
+        if !cur.is_empty() && cell_len(&cur) + 1 + n > w {
             lines.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -1510,7 +1638,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("↑ k / ↓ j   move            ⏎     open detail"),
         Line::from("PgUp PgDn   page            Esc   back"),
-        Line::from("g / G       top / bottom    o     open PR"),
+        Line::from("g / G       top / bottom    o     open review"),
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit            p     pause / resume"),
@@ -1527,11 +1655,55 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::wrap_words;
+    use super::{FRow, fit, lone_space_words, row_lines, wrap_words};
+
+    #[test]
+    fn fit_shows_a_control_character_in_ordinary_text_as_a_space() {
+        assert_eq!(fit("a\tb", 5), "a b");
+    }
+
+    #[test]
+    fn a_verbatim_row_cut_at_its_last_line_is_not_made_printable() {
+        let mut row = FRow::new("W", "a\tb c d".to_string());
+        row.wrap = true;
+        row.verbatim = true;
+        row.cap = 1;
+        assert_eq!(row_lines(&row, 1, 8), ["W  a\tb c…"]);
+    }
+
+    #[test]
+    fn only_a_space_with_no_whitespace_beside_it_ends_a_word() {
+        assert_eq!(
+            lone_space_words("a b  c \td \u{a0}e f\tg"),
+            ["a", "b  c \td \u{a0}e", "f\tg"]
+        );
+    }
 
     #[test]
     fn empty_input_is_one_empty_line() {
         assert_eq!(wrap_words("", 10), [""]);
         assert_eq!(wrap_words("   ", 0), [""]);
+    }
+
+    #[test]
+    fn lines_are_filled_by_terminal_cells_not_characters() {
+        // Two cells each: five characters and a space would take eleven.
+        assert_eq!(wrap_words("界界界 界界", 10), ["界界界", "界界"]);
+        // A long token is cut between characters, none of them split.
+        assert_eq!(wrap_words("界界界界界 x", 5), ["界界", "界界", "界 x"]);
+        // A character wider than the line still ends up somewhere.
+        assert_eq!(wrap_words("界界", 1), ["界", "界"]);
+        // A combining mark takes no cell.
+        let e = "e\u{301}";
+        let word = e.repeat(4);
+        assert_eq!(
+            wrap_words(&format!("{word} {word}"), 9),
+            [format!("{word} {word}")]
+        );
+    }
+
+    #[test]
+    fn a_control_character_is_measured_as_the_space_it_is_shown_as() {
+        assert_eq!(wrap_words("ab\u{1b}cd", 4), ["ab", "cd"]);
     }
 }

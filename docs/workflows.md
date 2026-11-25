@@ -696,11 +696,17 @@ awaiting_review:
   that is refused, with nothing recorded, because it would be taken as a note
   rather than a verdict.
 - An accepted reply stops the watcher.
+- `GET /tasks/<id>` reports the current gate's marker lines as
+  [`gate_markers`](cli.md#a-full-walkthrough), and `choco dashboard` shows them
+  in the [`Waiting for` row](cli.md#the-dashboard). Showing them doesn't check
+  a reply; the rules above do, when it is sent. Neither says that the gate has
+  a `watch:`, or what it watches.
 
 ## Publishing a review: `open_review`
 
 A task's review (a pull request, a merge request) is whatever an
-`open_review` stage published. The stage runs a command like a `shell` stage
+`open_review` stage published. The built-in coding workflows publish with one
+named `open_pr`; nothing looks for that name. The stage runs a command like a `shell` stage
 does, and its output tells choco which review the task has. choco learns no
 forge: it never reads the shape of the URL and knows no GitHub or GitLab. A
 workflow that doesn't publish a review shows none.
@@ -793,6 +799,35 @@ list, and doesn't change that task's payload. A custom workflow that publishes f
 `kind: shell` stage must change that stage to `kind: open_review`, and have the
 script print the object above, to keep showing a link for new tasks. choco does
 not bundle a GitLab command.
+
+### Using your own forge
+
+The built-in coding workflows' scripts talk to GitHub through `gh`. choco has
+no forge setting and bundles scripts for no other forge. To use your own, write
+a workflow YAML that names your own scripts and prompts, as
+[a file of your own or a repo workflow](#customising-workflows). You then own:
+
+- the **publisher**: an `open_review` stage that follows the rules above. As
+  under [Restarts and retries](#restarts-and-retries), it can run again after
+  it has already written to the forge, so it must find and update the review it
+  opened. Keeping what people edited in the review's description is its job
+  too;
+- every **observer**: the CI poll, the review watcher that turns comments or
+  approvals into outcomes, and the merge-only watchers of parked gates;
+- **authentication, host and policy** in those scripts (whose votes count, what
+  counts as green);
+- your **copies**: files you copied from the built-ins don't follow choco
+  updates.
+
+Pass agent-written text to a publisher through the stage's `env:`. The built-in
+publishers get the latest writer summary (`{{ stages.describe_pr.summary }}`)
+and the internal review's verdict and report this way. Each rendered `env:`
+value is capped at 64 KiB; a longer one is cut, ends with a line saying so, and
+is noted on the timeline.
+
+A `poll` or `watch:` matches its `outcomes` against the command's standard
+output even when the command exits non-zero. So print a line that decides an
+outcome only after every read it depends on has succeeded.
 
 ## Parallel stages
 

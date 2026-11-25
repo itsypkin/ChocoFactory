@@ -7631,6 +7631,23 @@ async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
     );
     // The writer's own summary is what `open_pr` is handed.
     let payload = payload_of(&pool, &task_id).await;
+    // The shipped script's real output passes the publication rules: it is
+    // the task's review, with the default label, and later stages still read
+    // its number and url.
+    assert_eq!(
+        crate::api::tasks::reviews_of(&payload),
+        [chocofactory_core::models::ReviewRef {
+            stage: "open_pr".into(),
+            number: 42,
+            url: "https://example.test/pr/42".into(),
+            label: "#42".into(),
+        }]
+    );
+    assert_eq!(payload["stages"]["open_pr"]["number"], 42);
+    assert_eq!(
+        payload["stages"]["open_pr"]["url"],
+        "https://example.test/pr/42"
+    );
     assert_eq!(
         payload["stages"]["describe_pr"]["summary"],
         "Writer description number 1."

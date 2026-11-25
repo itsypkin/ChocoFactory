@@ -43,7 +43,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 - **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
 - **Loop guards and escalation.** Repeated rejections, repeated red CI, a PR that keeps conflicting with its base (it is rebased, up to three times), or no verdict from you for about four days (checked every minute at first, then less often) park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck (a turn whose CLI says background work is still pending, on Claude Code or omp, is not nudged, but is marked stuck once its waits add up to 60 minutes in total for the turn). Work the CLI does not signal as pending, such as a named omp background service, gets no such protection: it is nudged after five minutes of silence like any quiet turn, and if the accepted report and a later clean end do not arrive before the nudges run out, the turn is closed as `no_report` and the task is marked stuck. If the service wakes the agent and the agent reports and ends first, the turn completes normally.
 - **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
-- **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
+- **Your verdict lives on the PR.** With the built-in coding workflows, comment `/approve` or `/request-changes` on the pull request.
 - **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
 - **Each coding task gets its own git worktree**, so tasks don't step on each other or on your checkout.
 
@@ -120,10 +120,10 @@ Keys for day one:
 | Key | Action |
 |---|---|
 | `⏎` | open the selected task's detail view |
-| `o` | open the task's pull request |
+| `o` | open the task's review link (the pull request, in the built-in coding workflows) |
 | `r` | retry a stuck task |
 | `c` | cancel a task |
-| `/` | search every task by PR number, title or id |
+| `/` | search every task by review number (`42`, `#42` or `!42`), title or id |
 | `?` | list all keys |
 | `q` | quit |
 

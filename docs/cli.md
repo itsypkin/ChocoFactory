@@ -234,6 +234,43 @@ Progress
   → coding (current, no transitions yet)
 ```
 
+**The review link.** Once an
+[`open_review` stage](workflows.md#publishing-a-review-open_review) has
+published (the built-in coding workflows' `open_pr` is one), `choco task
+status` shows one `Review` row after `Stage`: the publisher's label, then its
+URL.
+
+```
+Review    !42 https://review.example/team/repo/-/merge_requests/42
+```
+
+With `--json` the same is `reviews`, a list of at most one
+`{stage, number, url, label}`. This prints the URL, or nothing when the list is
+empty:
+
+```
+$ choco --json task status <id> | jq -r '.reviews[0].url // empty'
+```
+
+No row means choco has no published review recorded for the task. It doesn't
+mean that none exists on the forge. `choco task list` has no review column.
+
+**`gate_markers`.** `choco --json task status <id>` (`GET /tasks/<id>`; the rows
+of `task list` don't carry it) also has the
+[marker lines](workflows.md#a-human-gate-that-watches-for-its-answer) of the
+human gate at `workflow_state.current_stage`, read from the workflow the task
+runs as it reads at the time of the request:
+
+| `gate_markers` | Means |
+|---|---|
+| a list of lines | a human gate with these markers, in the order the workflow declares them |
+| `[]` | a human gate without markers |
+| `null` | the stage isn't a human gate, the task has no workflow state, or the workflow (or that stage in it) can't be read now; the daemon's log says why for the unreadable cases |
+
+It says nothing about whether the task takes a reply now (see `status`), or
+that any comment on a forge is watched. The daemon checks each reply when you
+send it.
+
 **Parallel groups.** A task whose current stage is a parallel group shows a
 `Branches` table between the fields and `Progress`, one row per branch:
 `branch`, `kind`, `state`, `result or reason` (the result of a `done` branch,
@@ -475,8 +512,9 @@ $ choco task list --project acme          # by name or id
 $ choco task list --status open           # free-form, not a fixed enum
 $ choco task list --status cancelled      # open | pausing | paused | stuck | closed | cancelled
 $ choco task list --status pausing,paused # a comma list works too
-$ choco task list --search '#289'         # the task whose PR is #289
-$ choco task list --search 289            # PR 289, or an id starting 289
+$ choco task list --search '#289'         # review number 289 exactly
+$ choco task list --search '!289'         # the same
+$ choco task list --search 289            # review 289, or an id starting 289
 $ choco task list --search parser         # title word (any case)
 $ choco task list --search ed9e8a7d       # id prefix
 $ choco task list --status open --search parser
@@ -487,7 +525,10 @@ $ choco project list
 `/` popup (see the dashboard section below), after `--project` and `--status`
 have narrowed the list. Rows stay in id order, not newest first. No match
 prints `No tasks matched.` (or `[]` under `--json`) and exits 0; blank text is
-refused with exit 2.
+refused with exit 2. The list shows no review column: `choco task status <id>`
+shows a task's link. Two repos can each have a review 289, so every match is
+listed. Searching is not how a task is named: the commands that take `<id>`
+don't take a review number.
 
 ## Pausing a task
 
@@ -764,7 +805,9 @@ project's name) and the header says `all projects`. With `--project` the column
 is gone and the header names the project. In a parallel group the stage column reads `<group> settled/total`, for
 example `review_panel 2/3`. Narrow terminals drop columns: below
 91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
-80 the laps and PR columns, below 60 the stage and project columns too.
+80 the laps and `Review` columns, below 60 the stage and project columns too.
+The `Review` column shows the publisher's label, cut with `…` when it is wider
+than six terminal cells; the search popup does the same.
 Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
 
 | Key | Action |
@@ -772,30 +815,61 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `↑` `k` / `↓` `j` | move, across section boundaries |
 | `PgUp` `PgDn`, `g` `G` | page; top / bottom |
 | `Tab` / `Shift-Tab` | next / previous non-empty section |
-| `⏎` | open the task's status view: the fields and progress `choco task status` shows (for a parallel group, its branch table too), the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
+| `⏎` | open the task's status view: the fields and progress `choco task status` shows (for a parallel group, its branch table too), its `Review` row included, the loop counters, how to reply when it waits at a human gate (the `Waiting for` row, below), a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
 | `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
-| `o` | open the task's pull request |
+| `o` | open the task's review link |
 | `r` | retry a `stuck` task (on a pausing or paused one it says to press `p`) |
 | `p` | pause an `open` task (graceful only; there is no `--now` here), or resume a `pausing` or `paused` one |
 | `s` | reply to the task: write a message in `$VISUAL` / `$EDITOR` and send it (see below) |
 | `c` | cancel an `open`, `pausing`, `paused` or `stuck` task |
-| `/` | search every task by PR number, title or id (from the list or the detail view) |
+| `/` | search every task by review number, title or id (from the list or the detail view) |
 | `?` | list the keys |
 | `q`, `Ctrl-C` | quit |
 
 The selection follows the task, not the row, so it stays put when a refresh
 re-sorts the list.
 
+In the status view, an `open` task waiting at a human gate has a `Waiting for`
+row. It always gives the command, with the task's id:
+`choco task send <id> --text "…"`. Before it, the row says one of:
+
+- the gate's marker lines, to use on a line of their own, each between
+  backticks and joined with ` or `. A line is shown as it is configured, with
+  no spaces collapsed. Invisible and control characters show however the
+  terminal draws them, which may be not at all (a tab, for one), and a marker
+  that itself contains ` or ` or a backtick can be hard to tell apart.
+  `gate_markers` has the lines exactly;
+- `a note`, for a gate without markers (a reply made up only of another gate's
+  marker lines is still [refused](workflows.md#a-human-gate-that-watches-for-its-answer));
+- `marker instructions unavailable, so a reply may be refused`, when the lines
+  can't be shown: the task's details haven't loaded, they are for another
+  stage than the list's latest refresh shows, or the daemon reports no markers
+  list for the gate (for example because the workflow file is gone or no longer
+  loads).
+
+A task that isn't at a gate, or is `pausing`, `paused`, `stuck`, `closed` or
+`cancelled`, has no such row. Once the task's details have loaded, the view's
+`Status` row shows their status, and any status but `open` there removes the
+`Waiting for` row, even when the list's latest refresh still says `open`. The
+lines come from the workflow, as `gate_markers` does: they don't mean that a
+comment on a forge is read, and the daemon decides whether a reply is accepted.
+On a short or narrow screen the row is cut or left out, so what is shown may not
+be all of it.
+
 `/` opens a search popup over the current view. It searches every task in the
 dashboard's scope (all statuses, including closed and cancelled tasks beyond
 `--closed`); the list is loaded once, when the popup opens. The query matches
 like this, newest task first:
 
-- `#289` matches the task whose pull request is #289 exactly (`#28` and `#2890`
-  do not match);
-- digits alone (`289`) match that PR number, or ids starting with those digits;
-- any other text matches titles containing it (ignoring case) or ids starting
-  with it.
+- `#289` or `!289` matches tasks whose review number is exactly 289 (not 28 or
+  2890), whatever the review's label says; titles and ids aren't searched;
+- digits alone (`289`) match that review number, or ids starting with those
+  digits;
+- any other text, a lone `#` or `!` included, matches titles containing it
+  (ignoring case) or ids starting with it.
+
+Numbers are compared as typed (`042` is not review 42, though it still matches
+an id starting `042`). Review labels and URLs aren't searched as such.
 
 `choco task list --search` uses the same rules.
 
@@ -838,8 +912,12 @@ Actions apply to the selected task (the open one, in the detail view):
   cause (`why it was not sent: …`), and one line for each send that had no
   answer yet. The file is removed once the daemon accepts the text or when it
   holds nothing.
-- `o` opens the PR with `open` (macOS) or `xdg-open`. Over SSH (`SSH_CONNECTION`
-  or `SSH_TTY` set) it launches nothing and prints `PR #N: <url>` instead.
+- `o` opens the review's URL with `open` (macOS) or `xdg-open`. In the status
+  view it uses the task's loaded details, and only until they load the list's
+  row; in the list, the selected row. Over SSH (`SSH_CONNECTION` or `SSH_TTY`
+  set) it launches nothing and shows `Review <label>: <url>` on the bottom line
+  (cut with `…` if the line is too narrow; `choco task status <id>` prints it
+  whole). With no published review it says `no review yet`.
 
 If the daemon goes away the last data stays on screen, the bottom line turns red
 (`daemon unreachable: …; retrying every 2s (data 34s old)`) and polling goes on,

@@ -190,6 +190,13 @@ pub struct TaskDetail {
     /// (#179): which stage stopped watching, after how long, and where a
     /// note goes. `null` otherwise.
     pub watch_timed_out: Option<crate::engine::WatchTimedOutInfo>,
+    /// The reply-marker lines of the human gate at
+    /// `workflow_state.current_stage`, from the workflow the task runs as it
+    /// reads now: an empty list is a gate without markers; `null` is a stage
+    /// that isn't a human gate, no workflow state, or a workflow that can't
+    /// be read. Not a sign that the task takes a reply (see `status`), nor
+    /// that anything watches a forge's comments.
+    pub gate_markers: Option<Vec<String>>,
     /// The task's turns waiting for a slot; empty when none is.
     pub queued: Vec<chocofactory_core::models::QueuedTurn>,
 }
@@ -413,6 +420,12 @@ pub async fn get(
         Some(ws) => state.engine.watch_timed_out(&task, ws).await,
         None => None,
     };
+    // The same state read the response carries, so the markers can't belong
+    // to another stage than the one reported beside them.
+    let gate_markers = state
+        .engine
+        .gate_markers(&task, workflow_state.as_ref())
+        .await;
     let queued = state.engine.queue_snapshot().await?.queued_for(&id);
     let reviews = workflow_state
         .as_ref()
@@ -423,6 +436,7 @@ pub async fn get(
         queued,
         usage,
         watch_timed_out,
+        gate_markers,
         task,
         kept,
         workflow_state,
@@ -2903,25 +2917,117 @@ stages:
         assert_eq!(waiting(&no_row), json!(false));
     }
 
-    fn seed_marker_gate(server: &TestServer) {
-        server.write_workflow(
-            "marker-gate",
-            r#"
+    /// Two gates with different markers, one without any, and a stage that
+    /// is no gate. A task starts at `gate`.
+    const MARKER_GATES: &str = r#"
 name: marker-gate
 stages:
   gate:
     kind: human_gate
     capture: text
     markers:
-      - line: /request-changes
+      - line: "choco: changes"
         then: changes_requested
-      - line: /approve
+      - line: "choco: accept"
         then: approved
     on: { approved: done, changes_requested: done }
+  ship:
+    kind: human_gate
+    markers:
+      - line: "choco: ship"
+        then: shipped
+    on: { shipped: note }
+  note:
+    kind: human_gate
+    capture: text
+    on: { resumed: done }
   done:
     kind: terminal
-"#,
-        );
+"#;
+
+    fn seed_marker_gate(server: &TestServer) {
+        server.write_workflow("marker-gate", MARKER_GATES);
+    }
+
+    #[tokio::test]
+    async fn get_task_reports_the_current_gates_markers_or_null_when_it_cannot_tell() {
+        let log = crate::test_support::LogBuf::default();
+        let _capture = log.capture();
+        let server = TestServer::start().await;
+        let dir = server.temp_dir().join("flows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gates.yaml");
+        std::fs::write(&file, MARKER_GATES).unwrap();
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id, "workflow_file": file.to_str().unwrap(),
+                    "title": "t", "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let id = task["id"].as_str().unwrap().to_string();
+        let recorded = task["workflow_path"].as_str().unwrap().to_string();
+        let markers = async || {
+            let response = server.get(&format!("/tasks/{id}")).await;
+            assert_eq!(response.status(), 200, "{}", response.json());
+            let detail = response.json();
+            let field = detail.as_object().unwrap().get("gate_markers");
+            field.expect("gate_markers is always present").clone()
+        };
+        let move_to = async |stage: &str| {
+            sqlx::query("UPDATE workflow_state SET current_stage = ? WHERE task_id = ?")
+                .bind(stage)
+                .bind(&id)
+                .execute(server.pool())
+                .await
+                .unwrap();
+        };
+
+        assert_eq!(markers().await, json!(["choco: changes", "choco: accept"]));
+        move_to("ship").await;
+        assert_eq!(markers().await, json!(["choco: ship"]));
+        move_to("done").await;
+        assert_eq!(markers().await, Value::Null);
+        let listed: Value = server.get("/tasks").await.json();
+        assert!(!listed[0].as_object().unwrap().contains_key("gate_markers"));
+
+        // A stage the definition doesn't have, then every way of losing the
+        // definition under a gate that reads as having no markers.
+        let unavailable = async |stage: &str, because: &str| {
+            let before = log.text().len();
+            assert_eq!(markers().await, Value::Null, "{because}");
+            let text = log.text()[before..].to_string();
+            let line = text
+                .lines()
+                .find(|l| l.contains("reporting gate_markers as null"))
+                .unwrap_or_else(|| panic!("no diagnostic: {text}"));
+            for want in [id.as_str(), stage, recorded.as_str(), because] {
+                assert!(line.contains(want), "{want:?} not in {line}");
+            }
+        };
+        move_to("gone").await;
+        unavailable("gone", "no longer defines the task's current stage").await;
+        move_to("note").await;
+        assert_eq!(markers().await, json!([]));
+        std::fs::write(&file, "name: marker-gate\nstages: [\n").unwrap();
+        unavailable("note", "failed to parse").await;
+        std::fs::remove_file(&file).unwrap();
+        unavailable("note", "recorded workflow file is missing").await;
+        std::fs::write(&file, MARKER_GATES).unwrap();
+        assert_eq!(markers().await, json!([]));
+        std::fs::remove_dir_all(&dir).unwrap();
+        unavailable("note", "recorded workflow file is missing").await;
+
+        sqlx::query("DELETE FROM workflow_state WHERE task_id = ?")
+            .bind(&id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        assert_eq!(markers().await, Value::Null);
     }
 
     async fn make_marker_task(server: &TestServer, project_id: &str) -> String {
@@ -2945,47 +3051,67 @@ stages:
         let server = TestServer::start().await;
         seed_marker_gate(&server);
         let project_id = create_project(&server).await;
+        let send = async |id: &str, text: &str| {
+            let path = format!("/tasks/{id}/messages");
+            server.post(&path, json!({ "text": text })).await
+        };
+        let events = async |id: &str| -> Vec<Value> {
+            let page: Value = server.get(&format!("/tasks/{id}/events")).await.json();
+            page["events"].as_array().unwrap().clone()
+        };
 
-        let accepted = make_marker_task(&server, &project_id).await;
-        let response = server
-            .post(
-                &format!("/tasks/{accepted}/messages"),
-                json!({ "text": "/approve" }),
-            )
-            .await;
-        assert_eq!(response.status(), 202, "{}", response.json());
-        let task: Value = server.get(&format!("/tasks/{accepted}")).await.json();
-        assert_eq!(task["workflow_state"]["current_stage"], "done");
+        // Both edges lead to `done`: the recorded outcome tells them apart.
+        for (marker, outcome) in [
+            ("choco: accept", "approved"),
+            ("choco: changes", "changes_requested"),
+        ] {
+            let id = make_marker_task(&server, &project_id).await;
+            let reply = format!("Read the whole change.\n{marker}\nOne note: keep the name.");
+            let response = send(&id, &reply).await;
+            assert_eq!(response.status(), 202, "{}", response.json());
+            let task: Value = server.get(&format!("/tasks/{id}")).await.json();
+            let state = &task["workflow_state"];
+            assert_eq!(state["current_stage"], "done");
+            assert_eq!(
+                state["payload"]["arrival"],
+                json!({ "from": "gate", "outcome": outcome })
+            );
+            assert_eq!(
+                state["payload"]["stages"]["gate"],
+                "Read the whole change.\nOne note: keep the name."
+            );
+            let results: Vec<Value> = events(&id)
+                .await
+                .into_iter()
+                .filter(|e| e["event_type"] == "stage_result")
+                .collect();
+            assert_eq!(results.len(), 1, "{results:?}");
+            assert_eq!(results[0]["payload"]["outcome"], outcome);
+        }
 
         let refused = make_marker_task(&server, &project_id).await;
-        let response = server
-            .post(
-                &format!("/tasks/{refused}/messages"),
-                json!({ "text": "ok" }),
-            )
-            .await;
-        assert_eq!(response.status(), 400);
-        let error = response.json()["error"].as_str().unwrap().to_string();
-        assert!(
-            error.contains("/request-changes") && error.contains("/approve"),
-            "{error}"
-        );
-        assert!(error.contains("Nothing was sent."), "{error}");
-        let task: Value = server.get(&format!("/tasks/{refused}")).await.json();
-        assert_eq!(task["workflow_state"]["current_stage"], "gate");
-
-        let conflict = make_marker_task(&server, &project_id).await;
-        let response = server
-            .post(
-                &format!("/tasks/{conflict}/messages"),
-                json!({ "text": "/approve\n/request-changes" }),
-            )
-            .await;
-        assert_eq!(response.status(), 400);
-        assert_eq!(
-            response.json()["error"],
-            "your reply has both /request-changes and /approve; keep one. Nothing was sent."
-        );
+        let before: Value = server.get(&format!("/tasks/{refused}")).await.json();
+        let history = events(&refused).await;
+        for (text, want) in [
+            (
+                "ok",
+                "put choco: changes or choco: accept alone on its own line",
+            ),
+            (
+                "choco: accept\nchoco: changes",
+                "your reply has both choco: changes and choco: accept; keep one. Nothing was sent.",
+            ),
+        ] {
+            let response = send(&refused, text).await;
+            assert_eq!(response.status(), 400, "{text:?}: {}", response.json());
+            let error = response.json()["error"].as_str().unwrap().to_string();
+            assert!(error.contains(want), "{error}");
+            assert!(error.contains("Nothing was sent."), "{error}");
+            let after: Value = server.get(&format!("/tasks/{refused}")).await.json();
+            assert_eq!(after["workflow_state"], before["workflow_state"]);
+            assert_eq!(after["workflow_state"]["current_stage"], "gate");
+            assert_eq!(events(&refused).await, history);
+        }
     }
 
     // ---- #166: an unknown `cli:` is rejected ----

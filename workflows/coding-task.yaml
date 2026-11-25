@@ -198,14 +198,13 @@ stages:
   # through a shell command line (a `command:` is templated as raw text; a
   # `script_file:` is not).
   open_pr:
-    kind: shell
+    kind: open_review
     script_file: scripts/open-pr.sh
     env:
       PR_TASK_TITLE: "{{ task.title }}"
       PR_DESCRIPTION: "{{ stages.describe_pr.summary }}"
       PR_REVIEW_VERDICT: "{{ stages.internal_review.outcome }}"
       PR_REVIEW_REPORT: "{{ stages.internal_review.summary }}"
-    capture: json
     timeout: 5m
     on: { done: checks_polling, error: escalate_to_human }
 

@@ -123,6 +123,24 @@ timing, templates, shell stages and roles are in
 stage. The short version: a misspelt stage key or role field is rejected
 when the workflow loads, but a misspelt top-level key is silently ignored.
 
+**Another forge or CI.** The built-in coding workflows' scripts use GitHub
+through `gh`; choco has no forge setting and bundles scripts for no other
+forge. In a workflow of your own, with your own script and prompt paths, you
+own:
+
+- the publisher (an `open_review` stage). It can run again after it already
+  wrote to the forge, so it must find and update the review it opened, and
+  keeping hand edits to the description is its job;
+- the CI poll, the review watcher and the merge-only watchers of parked gates;
+- authentication, host and policy in those scripts;
+- your copies of ejected files (section 2).
+
+Pass agent-written text through `env:` (each rendered value is capped at
+64 KiB), and have a watcher print a deciding line only after its reads
+succeeded, because its output is matched even when it exits non-zero. The
+publisher's output rules are in
+[publishing a review](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#publishing-a-review-open_review).
+
 ## 4. Try a change first
 
 1. Run one task with `--workflow <path>` before you commit.

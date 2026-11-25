@@ -3127,9 +3127,29 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "{wf}: only describe_pr's done edge enters open_pr"
             );
 
-            let StageKind::Shell { command, env, .. } = &def.stages["open_pr"].kind else {
-                panic!("{wf}: open_pr must be a shell stage");
+            let publisher = &def.stages["open_pr"];
+            let StageKind::Shell {
+                command,
+                env,
+                capture,
+                timeout,
+                publishes_review,
+            } = &publisher.kind
+            else {
+                panic!("{wf}: open_pr must run a command");
             };
+            assert!(*publishes_review, "{wf}: open_pr must publish the review");
+            assert_eq!(*capture, Some(Capture::Json), "{wf}: open_pr capture");
+            assert_eq!(
+                *timeout,
+                Some(std::time::Duration::from_secs(300)),
+                "{wf}: open_pr timeout"
+            );
+            assert_eq!(
+                on_map(publisher),
+                [("done", "checks_polling"), ("error", "escalate_to_human")],
+                "{wf}: open_pr's whole edge map"
+            );
             assert_eq!(
                 command,
                 &ShellCommand::ScriptFile(dir.path.join("scripts/open-pr.sh")),

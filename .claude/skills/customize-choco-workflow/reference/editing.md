@@ -32,7 +32,8 @@ where a task starts.
 `open_review` is a `shell` stage that publishes the task's review: its output
 must be a JSON object with `number` and `url`, and a workflow has at most one.
 See [publishing a review](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#publishing-a-review-open_review)
-for the rules and for what a retry must tolerate.
+for the rules and for what a retry must tolerate. What it prints is the link
+`choco task status` and the dashboard show.
 
 A misspelt stage key or role field is rejected when the workflow loads. A
 misspelt top-level key is not: only `name`, `roles`, `stages` and
@@ -78,6 +79,10 @@ a `then`).
 - Durations use `s`, `m` or `h` only, and are not zero.
 - Every `outcomes[].then` must be a key of `on:`.
 
+Outcomes are matched against stdout even when the command exits non-zero, so
+print a line that decides one only after every read it depends on has
+succeeded.
+
 See [a human gate that watches for its answer](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#a-human-gate-that-watches-for-its-answer).
 
 ## Human gate markers
@@ -87,6 +92,11 @@ whole line is matched, case-sensitive. A reply with no marker line is
 refused and nothing is sent. Each `then` must be a key of `on:`.
 Lines can't be empty, duplicated or padded with whitespace. Same section as
 above.
+
+The dashboard shows the current gate's marker lines with the
+`choco task send` command, from the workflow as it reads then. That is
+guidance: it doesn't mean the gate watches anything, and the daemon decides
+whether a reply is accepted.
 
 ## Prompts and templates
 
